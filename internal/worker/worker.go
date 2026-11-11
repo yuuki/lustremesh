@@ -5,14 +5,12 @@ package worker
 import (
 	"bufio"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"runtime"
 	"sync"
-	"syscall"
+	"sync/atomic"
 	"time"
 
 	"github.com/yuuki/lustremesh/internal/probe"
@@ -33,16 +31,28 @@ func Main(in io.Reader, out io.Writer) int {
 }
 
 func mainLoop(w *worker, in io.Reader) int {
-	sc := bufio.NewScanner(in)
-	sc.Buffer(make([]byte, 0, 64<<10), maxRequestBytes)
-	for sc.Scan() {
+	// The input is read apart from the steps, so that its end is noticed
+	// even while a step runs: a parent that closes it has given this worker
+	// up, and the worker must not start anything more.
+	lines := make(chan []byte)
+	go func() {
+		defer close(lines)
+		sc := bufio.NewScanner(in)
+		sc.Buffer(make([]byte, 0, 64<<10), maxRequestBytes)
+		for sc.Scan() {
+			lines <- append([]byte(nil), sc.Bytes()...)
+		}
+		w.orphan.Store(true)
+	}()
+	for line := range lines {
 		var req Request
-		if err := json.Unmarshal(sc.Bytes(), &req); err != nil {
+		if err := json.Unmarshal(line, &req); err != nil {
 			w.emit(Event{Type: EventDone, Error: "malformed request: " + err.Error()})
 			return 1
 		}
 		if !w.handle(req) {
-			// A step timed out: this process has been given up on.
+			// A step timed out, or the parent is gone: this process has
+			// been given up on.
 			return 0
 		}
 		if w.broken() {
@@ -56,7 +66,8 @@ type worker struct {
 	mu      sync.Mutex // serializes out and guards failed
 	out     *json.Encoder
 	failed  bool
-	backend backend // nil outside the tests
+	orphan  atomic.Bool // the input ended: the parent expects nothing more
+	backend backend     // nil outside the tests
 }
 
 func (w *worker) emit(ev Event) {
@@ -84,7 +95,10 @@ func (w *worker) handle(req Request) (alive bool) {
 		w.emit(Event{ID: req.ID, Type: EventDone, Error: "request without a step timeout"})
 		return true
 	}
-	r := &runner{w: w, id: req.ID, timeout: timeout}
+	r := &runner{w: w, id: req.ID, timeout: timeout, silence: time.Duration(req.SilenceNanos)}
+	if req.SentUnixNanos > 0 {
+		r.progress = time.Unix(0, req.SentUnixNanos)
+	}
 	b := w.backend
 	if b == nil {
 		b = newRealBackend(req.Probe)
@@ -110,13 +124,37 @@ type runner struct {
 	w       *worker
 	id      uint64
 	timeout time.Duration
+	// onTimeout runs when a step passes its deadline, before the timeout is
+	// reported.
+	onTimeout func()
+	// progress is when the parent last had news of this request: when it
+	// sent it, then each time a step ended. Past silence without news the
+	// parent gives the worker up. Both are zero when the parent set no limit.
+	progress time.Time
+	silence  time.Duration
+}
+
+// givenUp reports whether the parent has stopped listening: it closed the
+// input, or it has been without news for longer than it waits. Either way a
+// step started now would run unsupervised.
+func (r *runner) givenUp() bool {
+	if r.w.orphan.Load() {
+		return true
+	}
+	return r.silence > 0 && !r.progress.IsZero() && time.Since(r.progress) > r.silence
 }
 
 // step runs fn, which may never return. Exactly one of two things is
 // reported for it: its result, if it returns before the deadline, or a
 // timeout at the deadline followed, whenever fn returns, by its real
 // duration. The mutex makes the choice atomic, so the parent never sees both.
+//
+// inTime is false when the worker must stop: the step timed out, or the
+// parent closed the input and the step was not even started.
 func (r *runner) step(step probe.Step, fn func() probe.StepResult) (res probe.StepResult, inTime bool) {
+	if r.givenUp() {
+		return res, false
+	}
 	const (
 		running = iota
 		finished
@@ -133,6 +171,9 @@ func (r *runner) step(step probe.Step, fn func() probe.StepResult) (res probe.St
 		defer mu.Unlock()
 		if state == running {
 			state = timedOut
+			if r.onTimeout != nil {
+				r.onTimeout()
+			}
 			r.w.emit(Event{ID: r.id, Type: EventTimeout, Step: step})
 		}
 	})
@@ -147,6 +188,7 @@ func (r *runner) step(step probe.Step, fn func() probe.StepResult) (res probe.St
 	state = finished
 	res.Step = step
 	r.w.emit(Event{ID: r.id, Type: EventStep, Step: step, Result: &res})
+	r.progress = time.Now()
 	return res, true
 }
 
@@ -190,19 +232,28 @@ func (r *runner) visit(b backend, v Visit) bool {
 	}
 	dev.ServerNID = v.Device.ServerNID
 
-	lock, held, err := acquire(v.LockDir, dev.Label())
+	lock, state, err := acquire(v.LockDir, dev.Label(), r.timeout)
 	if err != nil {
 		r.w.emit(Event{ID: r.id, Type: EventDone, Error: err.Error()})
 		return true
 	}
-	if held {
+	switch state {
+	case lockStuck:
 		r.w.emit(Event{ID: r.id, Type: EventDone, Stuck: true})
+		return true
+	case lockBusy:
+		r.w.emit(Event{ID: r.id, Type: EventDone, Busy: true})
 		return true
 	}
 	// Held while the steps run: a step that never returns keeps the lock for
-	// as long as it blocks, which is the point. Released before "done", so
-	// that the parent may visit the target again at once.
+	// as long as it blocks, which is the point, and marks the target stuck
+	// when it passes its deadline. Released before "done", so that the
+	// parent may visit the target again at once.
+	r.onTimeout = lock.markStuck
+	b.inherit(lock.files())
 	alive := r.steps(b, dev, v.Data)
+	r.onTimeout = nil
+	b.inherit(nil)
 	lock.release()
 	if !alive {
 		return false
@@ -228,16 +279,14 @@ func (r *runner) steps(b backend, dev target.Device, data *Data) bool {
 	return true
 }
 
+// dataSteps are the steps of the data probe, in order.
+var dataSteps = []probe.Step{probe.StepOpen, probe.StepVerify, probe.StepWrite, probe.StepRead, probe.StepClose}
+
 // data runs the data probe behind the rpc gate. It returns false when a
 // step timed out.
 func (r *runner) data(b backend, dev target.Device, d Data, rpc probe.StepResult) bool {
-	steps := []probe.Step{probe.StepOpen}
-	if d.VerifyPin {
-		steps = append(steps, probe.StepPin)
-	}
-	steps = append(steps, probe.StepWrite, probe.StepRead, probe.StepClose)
 	skipFrom := func(i int, why string) {
-		for _, s := range steps[i:] {
+		for _, s := range dataSteps[i:] {
 			r.skip(s, why)
 		}
 	}
@@ -264,37 +313,31 @@ func (r *runner) data(b backend, dev target.Device, d Data, rpc probe.StepResult
 	}
 
 	// From here on the file is open and is closed under the watchdog too.
-	i := 1
 	why := ""
-	if d.VerifyPin {
-		pin, inTime := r.step(probe.StepPin, func() probe.StepResult { return f.Pin(d.LfsPath, dev.Index) })
-		if !inTime {
-			return false
-		}
-		i++
-		if pin.Result != probe.ResultOK {
-			why = "the file is not verified to be on " + dev.Label()
-		}
+	verify, inTime := r.step(probe.StepVerify, func() probe.StepResult { return f.Verify(d.LfsPath, d.VerifyPin, dev.Index) })
+	if !inTime {
+		return false
+	}
+	if verify.Result != probe.ResultOK {
+		why = "the file is not verified"
 	}
 	if why == "" {
 		wr, inTime := r.step(probe.StepWrite, func() probe.StepResult { return f.Write() })
 		if !inTime {
 			return false
 		}
-		i++
 		if !wr.Result.Answered() {
 			why = fmt.Sprintf("write was %s", wr.Result)
 		}
+	} else {
+		r.skip(probe.StepWrite, why)
 	}
 	if why == "" {
 		if _, inTime := r.step(probe.StepRead, func() probe.StepResult { return f.Read() }); !inTime {
 			return false
 		}
-		i++
-	}
-	// Skip what was not attempted, up to but not including close.
-	for _, s := range steps[i : len(steps)-1] {
-		r.skip(s, why)
+	} else {
+		r.skip(probe.StepRead, why)
 	}
 	_, inTime = r.step(probe.StepClose, func() probe.StepResult { return f.Close() })
 	return inTime
@@ -306,11 +349,14 @@ type backend interface {
 	importState(target.Device) string
 	rpc(target.Device) probe.StepResult
 	openData(probe.DataSpec) (dataFile, probe.StepResult)
+	// inherit names the files a child process started by a step must keep
+	// open: the target's locks.
+	inherit([]*os.File)
 	close()
 }
 
 type dataFile interface {
-	Pin(lfsPath string, want uint32) probe.StepResult
+	Verify(lfsPath string, checkOST bool, want uint32) probe.StepResult
 	Write() probe.StepResult
 	Read() probe.StepResult
 	Close() probe.StepResult
@@ -329,6 +375,7 @@ func (b *realBackend) discover() ([]target.Device, []string, error) { return pro
 func (b *realBackend) importState(d target.Device) string           { return b.p.ImportState(d) }
 func (b *realBackend) rpc(d target.Device) probe.StepResult         { return b.p.RPC(d) }
 func (b *realBackend) close()                                       { b.p.Close() }
+func (b *realBackend) inherit(files []*os.File)                     { b.p.Inherit = files }
 
 func (b *realBackend) openData(s probe.DataSpec) (dataFile, probe.StepResult) {
 	f, res := b.p.OpenData(s)
@@ -337,43 +384,4 @@ func (b *realBackend) openData(s probe.DataSpec) (dataFile, probe.StepResult) {
 		return nil, res
 	}
 	return f, res
-}
-
-// lock is a held target lock.
-type lock struct{ f *os.File }
-
-// acquire takes the lock of one target without waiting. held is true when
-// another process has it.
-func acquire(dir, label string) (l *lock, held bool, err error) {
-	if dir == "" {
-		return nil, false, errors.New("no lock directory")
-	}
-	path := filepath.Join(dir, label+".lock")
-	// Read-only is enough for flock and lets users share the lock files.
-	f, err := os.OpenFile(path, os.O_RDONLY|os.O_CREATE, 0o644) //nolint:gosec // label is a validated target name
-	if err != nil {
-		return nil, false, fmt.Errorf("lock file: %w", err)
-	}
-	for {
-		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-		if !errors.Is(err, syscall.EINTR) {
-			break
-		}
-	}
-	if errors.Is(err, syscall.EWOULDBLOCK) {
-		_ = f.Close()
-		return nil, true, nil
-	}
-	if err != nil {
-		_ = f.Close()
-		return nil, false, fmt.Errorf("lock %s: %w", path, err)
-	}
-	return &lock{f: f}, false, nil
-}
-
-func (l *lock) release() {
-	if l != nil && l.f != nil {
-		_ = l.f.Close()
-		l.f = nil
-	}
 }

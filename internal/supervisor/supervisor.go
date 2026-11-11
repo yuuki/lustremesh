@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"sync"
 	"time"
@@ -27,7 +28,8 @@ import (
 
 // Config configures a Supervisor.
 type Config struct {
-	// Command builds the command of a new worker process.
+	// Command builds the command of a new worker process. The supervisor
+	// sets its standard streams.
 	Command func() *exec.Cmd
 	// StepTimeout is the deadline of each step, enforced by the worker.
 	StepTimeout time.Duration
@@ -38,6 +40,9 @@ type Config struct {
 	Probe probe.Config
 	// LockDir is the directory of the per-target lock files.
 	LockDir string
+	// Stderr receives what the workers write to their standard error. It
+	// is written to from several goroutines. Nil discards it.
+	Stderr io.Writer
 }
 
 // Stall is the real duration of a step that timed out and returned later.
@@ -87,9 +92,29 @@ func (s *Supervisor) start() (*proc, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := cmd.Start(); err != nil {
+	// A worker gets a pipe of its own for its standard error, never this
+	// process's: a worker left blocked would otherwise keep that file open,
+	// and whoever waits for it to close (a shell pipeline, ssh, cron) would
+	// wait as long as the worker is blocked.
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	cmd.Stderr = errW
+	err = cmd.Start()
+	_ = errW.Close()
+	if err != nil {
+		_ = errR.Close()
 		return nil, fmt.Errorf("start worker: %w", err)
 	}
+	go func() {
+		defer func() { _ = errR.Close() }()
+		w := s.cfg.Stderr
+		if w == nil {
+			w = io.Discard
+		}
+		_, _ = io.Copy(w, errR)
+	}()
 	p := &proc{cmd: cmd, stdin: stdin, events: make(chan worker.Event, 16)}
 	go func() {
 		defer close(p.events)
@@ -105,9 +130,10 @@ func (s *Supervisor) start() (*proc, error) {
 	return p, nil
 }
 
-// abandon gives a worker up: it is told nothing more, and is neither killed
-// (a blocked O_DIRECT call ignores SIGKILL) nor waited for. If it reports
-// later how long its blocked step took, the stall is kept under label.
+// abandon gives a worker up: its input is closed, which tells it to start
+// nothing more, and it is neither killed (a blocked O_DIRECT call ignores
+// SIGKILL) nor waited for. If it reports later how long its blocked step
+// took, the stall is kept under label.
 func (s *Supervisor) abandon(p *proc, label string) {
 	_ = p.stdin.Close()
 	s.mu.Lock()
@@ -170,14 +196,27 @@ type outcome struct {
 	done  *worker.Event // the worker's "done" event
 	state string        // the import state the worker read, if any
 	// Otherwise the request broke at step (empty when no step had begun):
-	timedOut bool   // the step passed its deadline; the worker is given up
-	failure  string // the worker died or misbehaved, or the run was canceled
+	timedOut bool   // the worker reported that the step passed its deadline
+	failure  string // the worker died or went silent, or the run was canceled
 	step     probe.Step
+	// undelivered: the worker was gone before it saw the request. Nothing
+	// was sent to Lustre, so the request may be given to another worker.
+	undelivered bool
 }
 
 // run sends one request and follows it to its end. onStep sees the result of
-// each step that returned in time.
+// each step that returned in time. A request that found its worker dead is
+// given once to a fresh worker: a worker that died between two requests says
+// nothing about the target of the second.
 func (s *Supervisor) run(ctx context.Context, req worker.Request, label string, onStep func(probe.StepResult)) outcome {
+	out := s.attempt(ctx, req, label, onStep)
+	if out.undelivered {
+		out = s.attempt(ctx, req, label, onStep)
+	}
+	return out
+}
+
+func (s *Supervisor) attempt(ctx context.Context, req worker.Request, label string, onStep func(probe.StepResult)) outcome {
 	if s.cur == nil {
 		p, err := s.start()
 		if err != nil {
@@ -190,6 +229,12 @@ func (s *Supervisor) run(ctx context.Context, req worker.Request, label string, 
 	req.ID = s.nextID
 	req.StepTimeoutNanos = int64(s.cfg.StepTimeout)
 	req.Probe = s.cfg.Probe
+	// The worker enforces the deadline; the silence timer only catches a
+	// worker that stopped talking altogether. Waiting for a busy target's
+	// lock is the longest a healthy worker stays silent: one step timeout.
+	silence := s.cfg.StepTimeout + s.cfg.Grace
+	req.SentUnixNanos = time.Now().UnixNano()
+	req.SilenceNanos = int64(silence)
 
 	line, err := json.Marshal(req)
 	if err != nil {
@@ -198,17 +243,15 @@ func (s *Supervisor) run(ctx context.Context, req worker.Request, label string, 
 	if _, err := p.stdin.Write(append(line, '\n')); err != nil {
 		s.cur = nil
 		reap(p)
-		return outcome{failure: "worker is gone: " + err.Error()}
+		return outcome{failure: "the worker is gone: " + err.Error(), undelivered: true}
 	}
 
-	// The worker enforces the deadline; this timer only catches a worker
-	// that stopped talking altogether.
-	silence := s.cfg.StepTimeout + s.cfg.Grace
 	timer := time.NewTimer(silence)
 	defer timer.Stop()
 	var (
 		current probe.Step
 		state   string
+		heard   bool
 	)
 	for {
 		select {
@@ -216,11 +259,12 @@ func (s *Supervisor) run(ctx context.Context, req worker.Request, label string, 
 			if !ok {
 				s.cur = nil
 				reap(p)
-				return outcome{failure: "the worker exited", step: current, state: state}
+				return outcome{failure: "the worker exited", step: current, state: state, undelivered: !heard}
 			}
 			if ev.ID != req.ID {
 				continue
 			}
+			heard = true
 			if !timer.Stop() {
 				select {
 				case <-timer.C:
@@ -246,9 +290,13 @@ func (s *Supervisor) run(ctx context.Context, req worker.Request, label string, 
 				return outcome{done: &ev, state: state}
 			}
 		case <-timer.C:
+			// Not a timeout of the target: no step is known to have passed
+			// its deadline, the worker itself is frozen or starved. It is
+			// given up all the same, and its closed input keeps it from
+			// starting another step if it comes back.
 			s.cur = nil
 			s.abandon(p, label)
-			return outcome{timedOut: true, step: current, state: state}
+			return outcome{failure: fmt.Sprintf("the worker said nothing for %s", silence), step: current, state: state}
 		case <-ctx.Done():
 			s.cur = nil
 			s.abandon(p, "")
@@ -273,15 +321,10 @@ func (s *Supervisor) Discover(ctx context.Context) (devs []target.Device, skippe
 
 // Steps lists the steps of a visit, in order.
 func Steps(dev target.Device, data *worker.Data) []probe.Step {
-	steps := []probe.Step{probe.StepRPC}
 	if data == nil || dev.Kind != target.KindOST {
-		return steps
+		return []probe.Step{probe.StepRPC}
 	}
-	steps = append(steps, probe.StepOpen)
-	if data.VerifyPin {
-		steps = append(steps, probe.StepPin)
-	}
-	return append(steps, probe.StepWrite, probe.StepRead, probe.StepClose)
+	return []probe.Step{probe.StepRPC, probe.StepOpen, probe.StepVerify, probe.StepWrite, probe.StepRead, probe.StepClose}
 }
 
 // Visit probes one target. data is nil for the rpc probe only. The report
@@ -311,6 +354,8 @@ func (s *Supervisor) Visit(ctx context.Context, dev target.Device, data *worker.
 		switch {
 		case out.done != nil && out.done.Stuck:
 			return probe.StepResult{Step: step, Result: probe.ResultStuck, Detail: "an earlier probe of this target is still blocked"}
+		case out.done != nil && out.done.Busy:
+			return probe.Skipped(step, "another lustremesh process is probing this target")
 		case out.done != nil && out.done.Error != "":
 			return probe.StepResult{Step: step, Result: probe.ResultError, Detail: out.done.Error}
 		case out.done != nil:

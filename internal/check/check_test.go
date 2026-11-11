@@ -102,9 +102,9 @@ func table(r Report) string {
 	return strings.Join(out, "\n")
 }
 
-const allData = "rpc=ok open=ok pin=ok write=ok read=ok close=ok"
-const noData = "rpc=ok open=skipped pin=skipped write=skipped read=skipped close=skipped"
-const nothing = "rpc=skipped open=skipped pin=skipped write=skipped read=skipped close=skipped"
+const allData = "rpc=ok open=ok verify=ok write=ok read=ok close=ok"
+const noData = "rpc=ok open=skipped verify=skipped write=skipped read=skipped close=skipped"
+const nothing = "rpc=skipped open=skipped verify=skipped write=skipped read=skipped close=skipped"
 
 func TestHealthyCluster(t *testing.T) {
 	v := &fakeVisitor{devs: cluster(t)}
@@ -146,7 +146,7 @@ func TestRPCTimeoutHoldsTheServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := "MDT0000[rpc=ok]\n" +
-		"OST0000[rpc=timeout open=skipped pin=skipped write=skipped read=skipped close=skipped]\n" +
+		"OST0000[rpc=timeout open=skipped verify=skipped write=skipped read=skipped close=skipped]\n" +
 		"OST0001[" + nothing + "]\n" + // same server: not even an rpc probe
 		"OST0002[" + allData + "]\nOST0003[" + allData + "]"
 	if got := table(rep); got != want {
@@ -169,7 +169,7 @@ func TestWriteTimeoutHoldsDataOnTheServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := "MDT0000[rpc=ok]\nOST0000[" + allData + "]\nOST0001[" + allData + "]\n" +
-		"OST0002[rpc=ok open=ok pin=ok write=timeout read=skipped close=skipped]\n" +
+		"OST0002[rpc=ok open=ok verify=ok write=timeout read=skipped close=skipped]\n" +
 		"OST0003[" + noData + "]" // same server: the rpc probe only
 	if got := table(rep); got != want {
 		t.Errorf("got\n%s\nwant\n%s", got, want)
@@ -183,6 +183,7 @@ func TestMetadataTroubleHoldsAllData(t *testing.T) {
 	for name, results := range map[string]map[string]probe.Result{
 		"MDT disconnected": {"testfs-MDT0000/rpc": probe.ResultDisconnected},
 		"MDT timeout":      {"testfs-MDT0000/rpc": probe.ResultTimeout},
+		"MDT stuck":        {"testfs-MDT0000/rpc": probe.ResultStuck},
 	} {
 		v := &fakeVisitor{devs: cluster(t), results: results}
 		rep, err := Run(context.Background(), v, opts)
@@ -209,7 +210,7 @@ func TestMetadataTroubleHoldsAllData(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := "MDT0000[rpc=ok]\n" +
-		"OST0000[rpc=ok open=timeout pin=skipped write=skipped read=skipped close=skipped]\n" +
+		"OST0000[rpc=ok open=timeout verify=skipped write=skipped read=skipped close=skipped]\n" +
 		"OST0001[" + noData + "]\nOST0002[" + noData + "]\nOST0003[" + noData + "]"
 	if got := table(rep); got != want {
 		t.Errorf("got\n%s\nwant\n%s", got, want)
@@ -234,6 +235,82 @@ func TestFailuresThatAreNotTimeoutsHoldNothing(t *testing.T) {
 	}
 	if !rep.Failed() {
 		t.Error("not failed")
+	}
+
+	// An MDT that is deactivated, or whose probe failed for a reason of
+	// ours, does not say that the metadata path would block.
+	for _, res := range []probe.Result{probe.ResultInactive, probe.ResultError, probe.ResultSkipped} {
+		v := &fakeVisitor{devs: cluster(t), results: map[string]probe.Result{"testfs-MDT0000/rpc": res}}
+		if _, err := Run(context.Background(), v, opts); err != nil {
+			t.Fatal(err)
+		}
+		for _, visit := range v.visits[1:] {
+			if !strings.HasSuffix(visit, ":data") {
+				t.Errorf("MDT %s: %s", res, visit)
+			}
+		}
+	}
+}
+
+func TestVerifyTimeoutHoldsDataOnTheServerOnly(t *testing.T) {
+	// The verification can wait for the OST, so its timeout accuses the
+	// server of that OST, not the metadata path.
+	v := &fakeVisitor{devs: cluster(t), results: map[string]probe.Result{"testfs-OST0000/verify": probe.ResultTimeout}}
+	rep, err := Run(context.Background(), v, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "MDT0000[rpc=ok]\n" +
+		"OST0000[rpc=ok open=ok verify=timeout write=skipped read=skipped close=skipped]\n" +
+		"OST0001[" + noData + "]\nOST0002[" + allData + "]\nOST0003[" + allData + "]"
+	if got := table(rep); got != want {
+		t.Errorf("got\n%s\nwant\n%s", got, want)
+	}
+}
+
+func TestProbeLeftBlockedByAnEarlierRunHoldsItsServer(t *testing.T) {
+	// The earlier run timed out on OST0000 and held OST0001. This run finds
+	// OST0000 stuck: it must hold OST0001 again, not block a second worker.
+	v := &fakeVisitor{devs: cluster(t), results: map[string]probe.Result{
+		"testfs-OST0000/rpc": probe.ResultStuck,
+		"testfs-OST0001/rpc": probe.ResultTimeout, // what would happen if it were probed
+	}}
+	o := opts
+	o.StuckTargets = func() []string { return []string{"testfs-OST0000"} }
+	rep, err := Run(context.Background(), v, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, visit := range v.visits {
+		if strings.HasPrefix(visit, "testfs-OST0001") {
+			t.Errorf("visited %s", visit)
+		}
+	}
+	if v.abandoned != 0 {
+		t.Errorf("%d more workers blocked", v.abandoned)
+	}
+	if got := table(Report{Targets: rep.Targets[2:3]}); got != "OST0001["+nothing+"]" {
+		t.Errorf("OST0001: %s", got)
+	}
+	if len(rep.StuckTargets) != 1 || rep.StuckTargets[0] != "testfs-OST0000" || !rep.Failed() {
+		t.Errorf("report: stuck %v", rep.StuckTargets)
+	}
+}
+
+func TestBlockedProbesOfEarlierRunsCountTowardsTheLimit(t *testing.T) {
+	v := &fakeVisitor{devs: cluster(t)}
+	o := opts
+	o.MaxAbandoned = 2
+	o.StuckTargets = func() []string { return []string{"other-OST0000", "other-OST0001"} }
+	rep, err := Run(context.Background(), v, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v.visits) != 0 {
+		t.Errorf("visits %v", v.visits)
+	}
+	if first := rep.Targets[0].Steps[0]; first.Result != probe.ResultSkipped || !strings.Contains(first.Detail, "--max-abandoned") {
+		t.Errorf("first target: %+v", first)
 	}
 }
 
@@ -327,7 +404,7 @@ func sampleReport() Report {
 				Steps: []probe.StepResult{
 					{Step: probe.StepRPC, Result: probe.ResultOK, Nanos: ns(2_104_000), RPCSent: probe.RPCSentYes},
 					{Step: probe.StepOpen, Result: probe.ResultOK, Nanos: ns(410_000)},
-					{Step: probe.StepPin, Result: probe.ResultOK},
+					{Step: probe.StepVerify, Result: probe.ResultOK},
 					{Step: probe.StepWrite, Result: probe.ResultOK, Nanos: ns(1_912_000)},
 					{Step: probe.StepRead, Result: probe.ResultContended, Nanos: ns(640_000), Detail: "waited 200µs for a CPU"},
 					{Step: probe.StepClose, Result: probe.ResultOK},
@@ -336,7 +413,7 @@ func sampleReport() Report {
 				Steps: []probe.StepResult{
 					{Step: probe.StepRPC, Result: probe.ResultOK, Nanos: ns(300_000), RPCSent: probe.RPCSentYes},
 					{Step: probe.StepOpen, Result: probe.ResultOK, Nanos: ns(400_000)},
-					{Step: probe.StepPin, Result: probe.ResultOK},
+					{Step: probe.StepVerify, Result: probe.ResultOK},
 					{Step: probe.StepWrite, Result: probe.ResultTimeout, Detail: "no answer within 5s"},
 					probe.Skipped(probe.StepRead, "write timed out"),
 					probe.Skipped(probe.StepClose, "write timed out"),
@@ -349,8 +426,9 @@ func sampleReport() Report {
 					probe.Skipped(probe.StepWrite, "the rpc probe was disconnected"),
 				}},
 		},
-		Skipped: []string{"osc/testfs-OST0000-osc-MDT0000"},
-		Blocked: 1,
+		Skipped:      []string{"osc/testfs-OST0000-osc-MDT0000"},
+		Blocked:      1,
+		StuckTargets: []string{"testfs-OST0001", "testfs-OST0007"},
 	}
 }
 
@@ -366,6 +444,7 @@ testfs-OST0001  10.0.0.2@tcp  FULL     ok 300µs                 ok 400µs  time
 testfs-OST0002  unknown       unknown  disconnected EAGAIN 9µs  skipped   skipped    -                skipped: the rpc probe was disconnected
 
 4 targets of testfs, 2 with a step that got no answer; 1 worker(s) still blocked in a probe and left behind
+2 target(s) with a probe still blocked, from this run or an earlier one: testfs-OST0001, testfs-OST0007
 1 rpc probe(s) ok without proof that an RPC was sent: the RPC counters (debugfs) are not readable
 not client imports, ignored: osc/testfs-OST0000-osc-MDT0000
 `
@@ -388,7 +467,7 @@ func TestWriteJSONRoundTrips(t *testing.T) {
 		t.Errorf("round trip: %+v", out)
 	}
 	// Field names are part of the report's contract.
-	for _, field := range []string{`"fs"`, `"client_id"`, `"targets"`, `"target"`, `"server_nid"`, `"state"`, `"steps"`, `"step"`, `"result"`, `"nanos"`, `"errno"`, `"detail"`, `"rpc_sent"`, `"stall"`, `"blocked_workers"`, `"skipped_devices"`} {
+	for _, field := range []string{`"fs"`, `"client_id"`, `"targets"`, `"target"`, `"server_nid"`, `"state"`, `"steps"`, `"step"`, `"result"`, `"nanos"`, `"errno"`, `"detail"`, `"rpc_sent"`, `"stall"`, `"blocked_workers"`, `"stuck_targets"`, `"skipped_devices"`} {
 		if !strings.Contains(buf.String(), field) {
 			t.Errorf("no %s in the JSON report", field)
 		}
@@ -412,3 +491,21 @@ func TestFormatDuration(t *testing.T) {
 }
 
 func durationOf(nanos int64) time.Duration { return time.Duration(nanos) }
+
+func TestTextReportKeepsCommandOutputOnOneLine(t *testing.T) {
+	rep := Report{FS: "testfs", Targets: []Target{{
+		Target: "testfs-OST0000", ServerNID: "10.0.0.2@tcp", State: "FULL",
+		Steps: []probe.StepResult{
+			{Step: probe.StepRPC, Result: probe.ResultOK},
+			{Step: probe.StepVerify, Result: probe.ResultUnprepared, Detail: "lfs: two\nlines\tand \x1b[31mcolour"},
+		},
+	}}}
+	var buf bytes.Buffer
+	if err := WriteText(&buf, rep); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	if len(lines) != 4 || strings.ContainsAny(buf.String(), "\t\x1b") || !strings.Contains(lines[1], "verify: lfs: two lines and [31mcolour") {
+		t.Errorf("got %q", buf.String())
+	}
+}

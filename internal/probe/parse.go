@@ -5,9 +5,11 @@ package probe
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -93,21 +95,84 @@ func ParseRunDelay(data []byte) (delay time.Duration, ok bool) {
 	return time.Duration(v[1]), true //nolint:gosec // bounded just above
 }
 
-// ParseStripeIndex reads the output of "lfs getstripe -i <file>" for a file
-// with one stripe: a single decimal OST index.
-func ParseStripeIndex(out []byte) (uint32, error) {
-	s := string(bytes.TrimSpace(out))
-	if s == "" {
-		return 0, fmt.Errorf("lfs printed no stripe index")
-	}
-	n, err := strconv.ParseUint(s, 10, 32)
-	if err != nil {
-		if len(s) > 80 {
-			s = s[:80] + "..."
+// ParsePlainLayout reads the output of "lfs getstripe <file>" and returns
+// the OST index of a file with a plain layout of one stripe:
+//
+//	lmm_stripe_count:  1
+//	lmm_pattern:       raid0
+//	lmm_stripe_offset: 3
+//
+// Everything else is an error, on purpose: for a composite layout (PFL,
+// mirrors) or data on the MDT, no single index says where the first page
+// of the file lives.
+func ParsePlainLayout(out []byte) (uint32, error) {
+	var count, pattern, offset string
+	seen := map[string]bool{}
+	for len(out) > 0 {
+		var line []byte
+		line, out, _ = bytes.Cut(out, []byte{'\n'})
+		k, v, found := bytes.Cut(bytes.TrimSpace(line), []byte{':'})
+		if !found {
+			continue
 		}
-		return 0, fmt.Errorf("lfs printed %q, not one stripe index", s)
+		key, value := string(k), string(bytes.TrimSpace(v))
+		if strings.HasPrefix(key, "lcm_") || strings.HasPrefix(key, "lcme_") {
+			return 0, errors.New("the file has a composite layout, not a plain one")
+		}
+		switch key {
+		case "lmm_stripe_count":
+			count = value
+		case "lmm_pattern":
+			pattern = value
+		case "lmm_stripe_offset":
+			offset = value
+		default:
+			continue
+		}
+		if seen[key] {
+			return 0, fmt.Errorf("lfs printed %s twice", key)
+		}
+		seen[key] = true
+	}
+	for _, key := range []string{"lmm_stripe_count", "lmm_pattern", "lmm_stripe_offset"} {
+		if !seen[key] {
+			return 0, fmt.Errorf("lfs printed no %s", key)
+		}
+	}
+	if count != "1" {
+		return 0, fmt.Errorf("the file has %s stripes, not 1", OneLine([]byte(count), 20))
+	}
+	if pattern != "raid0" {
+		return 0, fmt.Errorf("the layout pattern is %q, not raid0", OneLine([]byte(pattern), 40))
+	}
+	n, err := strconv.ParseUint(offset, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("lfs printed the stripe offset %q", OneLine([]byte(offset), 40))
 	}
 	return uint32(n), nil
+}
+
+// OneLine makes text from elsewhere (a command's output) safe to show in a
+// one-line report: control characters and line breaks become spaces, runs of
+// spaces collapse, and the result is cut to max bytes.
+func OneLine(b []byte, max int) string {
+	var sb strings.Builder
+	space := false
+	for _, r := range strings.ToValidUTF8(string(b), "?") {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) || r == ' ' {
+			space = sb.Len() > 0
+			continue
+		}
+		if space {
+			sb.WriteByte(' ')
+			space = false
+		}
+		sb.WriteRune(r)
+		if sb.Len() >= max {
+			return sb.String()[:max] + "..."
+		}
+	}
+	return sb.String()
 }
 
 // ValidKbytes checks that the bytes read from a kbytesfree file are a decimal
@@ -162,6 +227,11 @@ func BuildPayload(page []byte, clientID string, seq uint64, now time.Time) {
 	if len(page) >= 8 {
 		binary.LittleEndian.PutUint64(page[len(page)-8:], seq)
 	}
+}
+
+// IsPayload reports whether a page starts like one a data probe wrote.
+func IsPayload(page []byte) bool {
+	return bytes.HasPrefix(page, []byte(payloadMagic))
 }
 
 // ValidClientID reports whether id can name a client's file under the probe

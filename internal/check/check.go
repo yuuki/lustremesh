@@ -37,8 +37,11 @@ type Options struct {
 	VerifyPin bool
 	// LfsPath is the lfs command.
 	LfsPath string
-	// MaxAbandoned stops the probes when that many workers are blocked.
+	// MaxAbandoned stops the probes when that many probes are blocked.
 	MaxAbandoned int
+	// StuckTargets lists the targets that have a blocked probe, whichever
+	// run left it. Nil when the lock directory cannot tell.
+	StuckTargets func() []string
 }
 
 // Target is the report of one target.
@@ -64,9 +67,13 @@ type Report struct {
 	// Skipped lists entries of the Lustre device directories that are not
 	// client imports.
 	Skipped []string `json:"skipped_devices,omitempty"`
-	// Blocked is the number of worker processes still blocked in a probe
-	// when the report was written. They are left behind on purpose.
+	// Blocked is the number of worker processes of this run still blocked
+	// in a probe when the report was written. They are left behind on
+	// purpose.
 	Blocked int `json:"blocked_workers"`
+	// StuckTargets lists the targets with a blocked probe when the report
+	// was written, left by this run or by an earlier one.
+	StuckTargets []string `json:"stuck_targets,omitempty"`
 }
 
 // Failed reports whether any step did not get an answer from its target.
@@ -83,12 +90,19 @@ func (r Report) Failed() bool {
 
 // Run discovers the targets and visits each once: MDTs first, then OSTs.
 //
-// Three holds bound the number of workers a single failure can block; each
-// lasts until the end of the run, since a one-shot check has no later:
-//   - a server whose rpc probe timed out is not probed again;
-//   - a server whose data probe timed out gets rpc probes only;
-//   - once an MDT did not answer, or an open, pin or close timed out, no data
-//     probe is sent at all: every one of them needs the metadata servers.
+// A probe that blocks costs a process that cannot be killed, so a failure
+// must not block one per target. Three holds see to that; each lasts until
+// the end of the run, since a one-shot check has no later, and each is set
+// again by a probe that an earlier run left blocked (ResultStuck):
+//   - a server whose rpc probe timed out, or with a blocked probe, is not
+//     probed again;
+//   - a server where the verification, the write or the read timed out gets
+//     rpc probes only: those steps can wait for the OST;
+//   - once an MDT timed out or is disconnected, or an open or a close timed
+//     out, no data probe is sent at all: every one needs the metadata servers.
+//
+// The run also stops probing when MaxAbandoned probes are blocked, counting
+// those of earlier runs.
 func Run(ctx context.Context, v Visitor, o Options) (Report, error) {
 	rep := Report{ClientID: o.ClientID, ProbeRoot: o.ProbeRoot}
 	devs, skipped, err := v.Discover(ctx)
@@ -123,8 +137,8 @@ func Run(ctx context.Context, v Visitor, o Options) (Report, error) {
 		switch {
 		case ctx.Err() != nil:
 			whyNot = "interrupted"
-		case v.Abandoned() >= o.MaxAbandoned:
-			whyNot = fmt.Sprintf("%d workers are blocked (--max-abandoned)", v.Abandoned())
+		case blocked(v, o) >= o.MaxAbandoned:
+			whyNot = fmt.Sprintf("%d probes are blocked (--max-abandoned)", blocked(v, o))
 		case serverHeld[server] != "":
 			whyNot = serverHeld[server]
 		}
@@ -163,17 +177,23 @@ func Run(ctx context.Context, v Visitor, o Options) (Report, error) {
 			timedOut := s.Result == probe.ResultTimeout
 			switch s.Step {
 			case probe.StepRPC:
-				if timedOut {
+				switch s.Result {
+				case probe.ResultTimeout:
 					serverHeld[server] = fmt.Sprintf("the rpc probe of %s on the same server timed out", dev.Label())
+				case probe.ResultStuck:
+					serverHeld[server] = fmt.Sprintf("a probe of %s on the same server is still blocked", dev.Label())
 				}
-				if dev.Kind == target.KindMDT && !s.Result.Answered() && metaHeld == "" {
-					metaHeld = fmt.Sprintf("%s did not answer (%s)", dev.Label(), s.Result)
+				if dev.Kind == target.KindMDT && metaHeld == "" {
+					switch s.Result {
+					case probe.ResultTimeout, probe.ResultDisconnected, probe.ResultStuck:
+						metaHeld = fmt.Sprintf("%s did not answer (%s)", dev.Label(), s.Result)
+					}
 				}
-			case probe.StepWrite, probe.StepRead:
+			case probe.StepVerify, probe.StepWrite, probe.StepRead:
 				if timedOut {
 					dataHeld[server] = fmt.Sprintf("%s of %s on the same server timed out", s.Step, dev.Label())
 				}
-			default: // open, pin, close: the metadata path
+			default: // open, close: the metadata path
 				if timedOut && metaHeld == "" {
 					metaHeld = fmt.Sprintf("%s of %s timed out", s.Step, dev.Label())
 				}
@@ -188,7 +208,22 @@ func Run(ctx context.Context, v Visitor, o Options) (Report, error) {
 		}
 	}
 	rep.Blocked = v.Abandoned()
+	if o.StuckTargets != nil {
+		rep.StuckTargets = o.StuckTargets()
+	}
 	return rep, nil
+}
+
+// blocked is the number of probes known to be blocked: those of this run's
+// abandoned workers, or those the lock directory shows, whichever is more.
+// The two overlap, and each can miss some (a worker given up for silence
+// holds no stuck lock; an earlier run's worker is not ours).
+func blocked(v Visitor, o Options) int {
+	n := v.Abandoned()
+	if o.StuckTargets != nil {
+		n = max(n, len(o.StuckTargets()))
+	}
+	return n
 }
 
 // serverKey groups the targets of one server. A target whose server is not

@@ -6,6 +6,7 @@ package probe
 
 import (
 	"errors"
+	"os"
 
 	"github.com/yuuki/lustremesh/internal/target"
 )
@@ -15,7 +16,9 @@ import (
 var errUnsupported = errors.New("lustremesh probes need Linux")
 
 // Prober is a stub outside Linux.
-type Prober struct{}
+type Prober struct {
+	Inherit []*os.File
+}
 
 // NewProber returns a stub.
 func NewProber(Config) *Prober { return &Prober{} }
@@ -39,9 +42,9 @@ func (p *Prober) OpenData(DataSpec) (*DataFile, StepResult) {
 	return nil, StepResult{Step: StepOpen, Result: ResultError, Detail: errUnsupported.Error()}
 }
 
-// Pin always fails.
-func (f *DataFile) Pin(string, uint32) StepResult {
-	return StepResult{Step: StepPin, Result: ResultUnprepared, Detail: errUnsupported.Error()}
+// Verify always fails.
+func (f *DataFile) Verify(string, bool, uint32) StepResult {
+	return StepResult{Step: StepVerify, Result: ResultUnprepared, Detail: errUnsupported.Error()}
 }
 
 // Write always fails.

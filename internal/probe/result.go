@@ -56,7 +56,7 @@ const (
 	StepDiscover Step = "discover"
 	StepRPC      Step = "rpc"
 	StepOpen     Step = "open"
-	StepPin      Step = "pin"
+	StepVerify   Step = "verify"
 	StepWrite    Step = "write"
 	StepRead     Step = "read"
 	StepClose    Step = "close"

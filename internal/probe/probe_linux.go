@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/yuuki/lustremesh/internal/target"
 )
 
@@ -28,6 +30,9 @@ type Prober struct {
 	cfg     Config
 	schedFD int // -1 when the kernel has no schedstat
 	small   [64]byte
+	// Inherit lists the files a child process (lfs) keeps open, so that
+	// the locks they carry outlive this process if the child blocks.
+	Inherit []*os.File
 }
 
 // NewProber prepares a prober for the calling thread.
@@ -127,8 +132,10 @@ func (p *Prober) statfsCount(dev target.Device) (uint64, bool) {
 
 // RPC sends the rpc probe: one read of the device's kbytesfree, which makes
 // the client send a statfs RPC to the target unless its one-second cache
-// answers. The read does not wait for a disconnected import: it fails with
-// EAGAIN, reported as ResultDisconnected.
+// answers. The read does not wait for an import that is known to be
+// disconnected: it fails with EAGAIN, reported as ResultDisconnected. It
+// does wait for an idle import to reconnect, and so blocks when the server
+// of an idle import is down.
 func (p *Prober) RPC(dev target.Device) StepResult {
 	r := StepResult{Step: StepRPC, Result: ResultError, RPCSent: RPCSentUnknown}
 	path := filepath.Join(p.cfg.SysfsRoot, dev.ClientType(), dev.Name, "kbytesfree")
@@ -146,12 +153,8 @@ func (p *Prober) RPC(dev target.Device) StepResult {
 	p.measured(&r, elapsed, delay, err)
 	if err != nil {
 		r.Errno = errnoName(err)
-		switch {
-		case errors.Is(err, syscall.EAGAIN):
-			r.Result = ResultDisconnected
-		case errors.Is(err, syscall.ESHUTDOWN), errors.Is(err, syscall.ENODATA):
-			r.Result = ResultInactive
-		default:
+		r.Result = classifyRPCError(err)
+		if r.Result == ResultError {
 			r.Detail = "read " + path + ": " + err.Error()
 		}
 		return r
@@ -177,21 +180,37 @@ func (p *Prober) RPC(dev target.Device) StepResult {
 	return r
 }
 
+// classifyRPCError maps the error of the kbytesfree read to a result.
+func classifyRPCError(err error) Result {
+	switch {
+	case errors.Is(err, syscall.EAGAIN):
+		return ResultDisconnected
+	case errors.Is(err, syscall.ESHUTDOWN), errors.Is(err, syscall.ENODATA):
+		return ResultInactive
+	default:
+		return ResultError
+	}
+}
+
 // DataFile is a client's pinned file on one OST, open for a data probe.
 type DataFile struct {
 	p        *Prober
 	fd       int
 	path     string
 	clientID string
-	st       syscall.Stat_t
+	id       fileID
+	verified bool
 	mem      []byte // two pages: the write buffer, then the read buffer
 	page     int
 }
 
 // OpenData opens the pinned file, timing only the final open. It walks the
 // probe root one component at a time and never follows a symbolic link below
-// it. A missing or unsuitable file is ResultUnprepared, never created here:
-// creating it needs "lfs setstripe -o" (docs/design.md §5.1).
+// it. A missing file is ResultUnprepared, never created here: creating it
+// needs "lfs setstripe -o" (docs/design.md §5.1).
+//
+// Everything OpenData does goes to the metadata servers only. Whether the
+// file may be written to is checked by Verify, which can involve the OST.
 func (p *Prober) OpenData(spec DataSpec) (*DataFile, StepResult) {
 	r := StepResult{Step: StepOpen, Result: ResultError}
 	if !ValidClientID(spec.ClientID) || !validIndexHex(spec.IndexHex) {
@@ -229,19 +248,6 @@ func (p *Prober) OpenData(spec DataSpec) (*DataFile, StepResult) {
 	}
 
 	f := &DataFile{p: p, fd: fd, path: path, clientID: spec.ClientID, page: os.Getpagesize()}
-	if err := syscall.Fstat(fd, &f.st); err != nil {
-		_ = syscall.Close(fd)
-		r.Result = ResultError
-		r.Errno = errnoName(err)
-		r.Detail = "fstat " + path + ": " + err.Error()
-		return nil, r
-	}
-	if why := unsuitable(&f.st); why != "" {
-		_ = syscall.Close(fd)
-		r.Result = ResultUnprepared
-		r.Detail = path + " " + why
-		return nil, r
-	}
 	// Anonymous mappings are page aligned, as O_DIRECT requires of the
 	// buffer; the offset (0) and the length (one page) are aligned too.
 	f.mem, err = syscall.Mmap(-1, 0, 2*f.page, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_ANON|syscall.MAP_PRIVATE)
@@ -267,48 +273,128 @@ func openFailure(r StepResult, path string, err error) StepResult {
 	return r
 }
 
+// fileID is what identifies a file and tells whether it may be written to.
+type fileID struct {
+	dev   uint64
+	ino   uint64
+	mode  uint32
+	uid   uint32
+	nlink uint64
+}
+
+// idMask leaves out the size, the block count and the times on purpose: on
+// Lustre those are asked of the OST, and this is not the probe.
+const idMask = unix.STATX_TYPE | unix.STATX_MODE | unix.STATX_NLINK | unix.STATX_UID | unix.STATX_INO
+
+// identify reads the identity of an open file (path "") or of a path, whose
+// last component is not followed. It prefers statx, which can leave the OST
+// alone; a kernel without statx falls back to stat.
+func identify(fd int, path string) (fileID, error) {
+	dirfd, flags := unix.AT_FDCWD, unix.AT_SYMLINK_NOFOLLOW|unix.AT_STATX_DONT_SYNC
+	if path == "" {
+		dirfd, flags = fd, unix.AT_EMPTY_PATH|unix.AT_STATX_DONT_SYNC
+	}
+	var sx unix.Statx_t
+	for {
+		err := unix.Statx(dirfd, path, flags, idMask, &sx)
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if err == nil && sx.Mask&idMask == idMask {
+			return fileID{
+				dev:   unix.Mkdev(sx.Dev_major, sx.Dev_minor),
+				ino:   sx.Ino,
+				mode:  uint32(sx.Mode),
+				uid:   sx.Uid,
+				nlink: uint64(sx.Nlink),
+			}, nil
+		}
+		if err != nil && !errors.Is(err, syscall.ENOSYS) {
+			return fileID{}, err
+		}
+		break
+	}
+	var st syscall.Stat_t
+	var err error
+	if path == "" {
+		err = syscall.Fstat(fd, &st)
+	} else {
+		err = syscall.Lstat(path, &st)
+	}
+	if err != nil {
+		return fileID{}, err
+	}
+	return fileID{dev: uint64(st.Dev), ino: st.Ino, mode: st.Mode, uid: st.Uid, nlink: uint64(st.Nlink)}, nil //nolint:unconvert // the field types differ between architectures
+}
+
 // unsuitable says why a file must not be written to, or "". The probe
 // overwrites the first page, so the file has to be this user's own regular
 // file under one name only: a hard link to somebody else's file is refused.
-func unsuitable(st *syscall.Stat_t) string {
+func (id fileID) unsuitable() string {
 	switch {
-	case st.Mode&syscall.S_IFMT != syscall.S_IFREG:
+	case id.mode&syscall.S_IFMT != syscall.S_IFREG:
 		return "is not a regular file"
-	case int(st.Uid) != os.Geteuid():
-		return fmt.Sprintf("belongs to uid %d, not to this user (uid %d)", st.Uid, os.Geteuid())
-	case uint64(st.Nlink) != 1: //nolint:unconvert // Nlink is uint32 on some architectures
-		return fmt.Sprintf("has %d hard links", st.Nlink)
+	case int(id.uid) != os.Geteuid():
+		return fmt.Sprintf("belongs to uid %d, not to this user (uid %d)", id.uid, os.Geteuid())
+	case id.nlink != 1:
+		return fmt.Sprintf("has %d hard links", id.nlink)
 	}
 	return ""
 }
 
-// Pin checks with "lfs getstripe -i" that the file's object is on the OST
-// the probe is attributed to. Anything else than a positive answer is
-// ResultUnprepared: a probe of the wrong OST must not be sent.
-func (f *DataFile) Pin(lfsPath string, want uint32) StepResult {
-	r := StepResult{Step: StepPin, Result: ResultUnprepared}
+// Verify decides whether the open file may be written to: it must be this
+// user's own regular file with one link and, when checkOST is set, "lfs
+// getstripe" must show a plain layout of one stripe on the OST the probe is
+// attributed to. Anything else is ResultUnprepared: a probe must overwrite
+// nobody's data and must not be sent to another OST than the one it names.
+//
+// Unlike OpenData, Verify can wait for the OST: reading a file's attributes
+// or layout may ask the OST on some Lustre versions.
+func (f *DataFile) Verify(lfsPath string, checkOST bool, want uint32) StepResult {
+	r := StepResult{Step: StepVerify, Result: ResultUnprepared}
+	id, err := identify(f.fd, "")
+	if err != nil {
+		r.Result = ResultError
+		r.Errno = errnoName(err)
+		r.Detail = "stat " + f.path + ": " + err.Error()
+		return r
+	}
+	f.id = id
+	if why := id.unsuitable(); why != "" {
+		r.Detail = f.path + " " + why
+		return r
+	}
+	if !checkOST {
+		f.verified = true
+		r.Result = ResultOK
+		return r
+	}
+
 	bin, err := exec.LookPath(lfsPath)
 	if err != nil {
 		r.Detail = "cannot verify the OST of " + f.path + ": " + err.Error()
 		return r
 	}
-	cmd := exec.CommandContext(context.Background(), bin, "getstripe", "-i", f.path)
+	cmd := exec.CommandContext(context.Background(), bin, "getstripe", f.path)
 	cmd.Env = []string{"LC_ALL=C", "PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
+	// lfs may block as this process can. It inherits the target's locks, so
+	// that the target stays locked while lfs lives, even if this process is
+	// killed meanwhile.
+	cmd.ExtraFiles = f.p.Inherit
 	var stderr bytes.Buffer
 	cmd.Stderr = &limitedWriter{w: &stderr, n: 512}
 	out, err := cmd.Output()
 	if err != nil {
-		r.Detail = fmt.Sprintf("%s getstripe -i %s: %v: %s", bin, f.path, err, bytes.TrimSpace(stderr.Bytes()))
+		r.Detail = fmt.Sprintf("%s getstripe %s: %v: %s", bin, f.path, err, OneLine(stderr.Bytes(), 200))
 		return r
 	}
-	got, err := ParseStripeIndex(out)
+	got, err := ParsePlainLayout(out)
 	if err != nil {
 		r.Detail = f.path + ": " + err.Error()
 		return r
 	}
 	// lfs resolved the path again: make sure it looked at the open file.
-	var st syscall.Stat_t
-	if err := syscall.Lstat(f.path, &st); err != nil || st.Ino != f.st.Ino || st.Dev != f.st.Dev {
+	if again, err := identify(-1, f.path); err != nil || again.ino != id.ino || again.dev != id.dev {
 		r.Detail = f.path + " changed while its OST was verified"
 		return r
 	}
@@ -316,13 +402,19 @@ func (f *DataFile) Pin(lfsPath string, want uint32) StepResult {
 		r.Detail = fmt.Sprintf("%s is on OST index %d, not %d", f.path, got, want)
 		return r
 	}
+	f.verified = true
 	r.Result = ResultOK
 	return r
 }
 
-// Write overwrites the first page of the file with a fresh payload.
+// Write overwrites the first page of the file with a fresh payload. It
+// refuses a file that Verify did not accept.
 func (f *DataFile) Write() StepResult {
 	r := StepResult{Step: StepWrite, Result: ResultError}
+	if !f.verified {
+		r.Detail = "the file was not verified"
+		return r
+	}
 	var seq [8]byte
 	if _, err := rand.Read(seq[:]); err != nil {
 		r.Detail = "random sequence number: " + err.Error()
@@ -366,6 +458,10 @@ func (f *DataFile) Read() StepResult {
 	if !bytes.Equal(wbuf, rbuf) {
 		r.Result = ResultMismatch
 		r.Detail = "the page read back is not the page just written"
+		if IsPayload(rbuf) {
+			// Not corruption: a whole page of another probe.
+			r.Detail = "the page read back was written by another probe: is the client ID used by two clients?"
+		}
 	}
 	return r
 }

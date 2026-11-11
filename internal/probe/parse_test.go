@@ -59,14 +59,60 @@ func TestParseRunDelay(t *testing.T) {
 	}
 }
 
-func TestParseStripeIndex(t *testing.T) {
-	if n, err := ParseStripeIndex([]byte("12\n")); err != nil || n != 12 {
-		t.Errorf("got %d, %v", n, err)
+// plainLayout is hand-written in the format "lfs getstripe <file>" prints
+// for a file with one stripe.
+const plainLayout = `/mnt/testfs/.lustremesh/v1/ost/0003/node-a001
+lmm_stripe_count:  1
+lmm_stripe_size:   1048576
+lmm_pattern:       raid0
+lmm_layout_gen:    0
+lmm_stripe_offset: 3
+	obdidx		 objid		 objid		 group
+	     3	           514	        0x202	             0
+
+`
+
+func TestParsePlainLayout(t *testing.T) {
+	if n, err := ParsePlainLayout([]byte(plainLayout)); err != nil || n != 3 {
+		t.Errorf("plain layout: %d, %v", n, err)
 	}
-	for _, in := range []string{"", "\n", "-1\n", "0\n1\n", "lmm_stripe_offset: 3\n", "4294967296\n", "3 4\n"} {
-		if n, err := ParseStripeIndex([]byte(in)); err == nil {
-			t.Errorf("ParseStripeIndex(%q) = %d, want an error", in, n)
+	bad := map[string]string{
+		"empty":           "",
+		"only an index":   "3\n",
+		"two stripes":     strings.Replace(plainLayout, "lmm_stripe_count:  1", "lmm_stripe_count:  2", 1),
+		"data on the MDT": strings.Replace(plainLayout, "raid0", "mdt", 1),
+		"released":        strings.Replace(plainLayout, "raid0", "raid0,released", 1),
+		"no pattern":      strings.Replace(plainLayout, "lmm_pattern:       raid0\n", "", 1),
+		"no offset":       strings.Replace(plainLayout, "lmm_stripe_offset: 3\n", "", 1),
+		"negative offset": strings.Replace(plainLayout, "lmm_stripe_offset: 3", "lmm_stripe_offset: -1", 1),
+		"offset repeated": plainLayout + "lmm_stripe_offset: 4\n",
+		// A composite file: several components, each with its own stripes.
+		"composite": "/mnt/testfs/f\n  lcm_layout_gen:    2\n  lcm_mirror_count:  1\n  lcm_entry_count:   2\n" +
+			"    lcme_id:             1\n      lmm_stripe_count:  1\n      lmm_pattern:       raid0\n      lmm_stripe_offset: 3\n",
+	}
+	for name, out := range bad {
+		if n, err := ParsePlainLayout([]byte(out)); err == nil {
+			t.Errorf("%s: accepted as OST %d", name, n)
 		}
+	}
+}
+
+func TestOneLine(t *testing.T) {
+	tests := map[string]string{
+		"plain":                 "plain",
+		"two\nlines\tand a tab": "two lines and a tab",
+		"  padded   text \n":    "padded text",
+		"esc\x1b[31mape\x07":    "esc [31mape",
+		"bad \xff utf8":         "bad ? utf8",
+		"":                      "",
+	}
+	for in, want := range tests {
+		if got := OneLine([]byte(in), 100); got != want {
+			t.Errorf("OneLine(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if got := OneLine([]byte(strings.Repeat("a", 50)), 10); got != "aaaaaaaaaa..." {
+		t.Errorf("cut: %q", got)
 	}
 }
 
@@ -120,6 +166,9 @@ func TestBuildPayload(t *testing.T) {
 		t.Error("tiny pages are equal")
 	}
 	BuildPayload(nil, "x", 1, now) // must not panic
+	if !IsPayload(a) || IsPayload(make([]byte, 4096)) || IsPayload(nil) {
+		t.Error("IsPayload")
+	}
 }
 
 func TestClientID(t *testing.T) {
@@ -185,7 +234,7 @@ func FuzzParsers(f *testing.F) {
 	f.Add([]byte("ost_statfs 17 samples [usec] 80 400 2000\n"))
 	f.Add([]byte("current_state: FULL\n"))
 	f.Add([]byte("123456 7890 12\n"))
-	f.Add([]byte("3\n"))
+	f.Add([]byte(plainLayout))
 	f.Add([]byte("10.0.0.2@tcp\n"))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		ParseStatCount(data, "ost_statfs")
@@ -195,13 +244,16 @@ func FuzzParsers(f *testing.F) {
 		if d, ok := ParseRunDelay(data); ok && d < 0 {
 			t.Fatalf("negative run delay %v", d)
 		}
-		_, _ = ParseStripeIndex(data)
+		_, _ = ParsePlainLayout(data)
+		if line := OneLine(data, 64); len(line) > 64+3 || strings.ContainsAny(line, "\n\r\t\x1b\x00") {
+			t.Fatalf("OneLine gave %q", line)
+		}
 		ValidKbytes(data)
 		nid := SanitizeNID(data)
 		if strings.ContainsAny(nid, " \t\n\"\\{}") {
 			t.Fatalf("NID %q", nid)
 		}
-		if id := NormalizeClientID(string(data)); id != "" && !ValidClientID(id) {
+		if id := NormalizeClientID(string(data)); strings.ContainsAny(id, "/\x00 ") || id == "." || id == ".." || len(id) > 255 {
 			t.Fatalf("client ID %q", id)
 		}
 	})

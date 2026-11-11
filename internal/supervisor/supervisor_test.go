@@ -5,12 +5,15 @@
 package supervisor
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -38,19 +41,41 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	case "dead": // exits at once
 		os.Exit(3)
+	case "noisy": // a worker that also writes to its standard error
+		fmt.Fprintln(os.Stderr, "a word from the worker")
+		os.Exit(worker.Main(os.Stdin, os.Stdout))
 	}
 }
 
 type env struct {
-	t    *testing.T
-	dir  string
-	sup  *Supervisor
-	mode string
+	t      *testing.T
+	dir    string
+	sup    *Supervisor
+	mode   string
+	stderr *lockedBuffer
+}
+
+// lockedBuffer is a buffer the supervisor's goroutines may write to.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func newEnv(t *testing.T, timeout time.Duration) *env {
 	t.Helper()
-	e := &env{t: t, dir: t.TempDir(), mode: "worker"}
+	e := &env{t: t, dir: t.TempDir(), mode: "worker", stderr: &lockedBuffer{}}
 	lockDir := filepath.Join(e.dir, "lock")
 	if err := os.Mkdir(lockDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -59,9 +84,9 @@ func newEnv(t *testing.T, timeout time.Duration) *env {
 		Command: func() *exec.Cmd {
 			cmd := exec.Command(os.Args[0])
 			cmd.Env = append(os.Environ(), modeEnv+"="+e.mode)
-			cmd.Stderr = os.Stderr
 			return cmd
 		},
+		Stderr:      e.stderr,
 		StepTimeout: timeout,
 		Grace:       200 * time.Millisecond,
 		LockDir:     lockDir,
@@ -186,7 +211,7 @@ func TestDiscoverAndVisit(t *testing.T) {
 
 	data := e.dataFile(ost, "node-a001")
 	r = e.sup.Visit(ctx, ost, data)
-	if got, want := summary(r), "rpc=ok open=ok write=ok read=ok close=ok"; got != want {
+	if got, want := summary(r), "rpc=ok open=ok verify=ok write=ok read=ok close=ok"; got != want {
 		t.Errorf("data: %q, want %q (%+v)", got, want, r.Steps)
 	}
 
@@ -195,7 +220,7 @@ func TestDiscoverAndVisit(t *testing.T) {
 	data.LfsPath = filepath.Join(e.dir, "no-such-lfs")
 	before, _ := os.ReadFile(filepath.Join(data.Root, "v1", "ost", ost.IndexHex, "node-a001"))
 	r = e.sup.Visit(ctx, ost, data)
-	if got, want := summary(r), "rpc=ok open=ok pin=unprepared write=skipped read=skipped close=ok"; got != want {
+	if got, want := summary(r), "rpc=ok open=ok verify=unprepared write=skipped read=skipped close=ok"; got != want {
 		t.Errorf("unverified pin: %q, want %q", got, want)
 	}
 	after, _ := os.ReadFile(filepath.Join(data.Root, "v1", "ost", ost.IndexHex, "node-a001"))
@@ -216,7 +241,7 @@ func TestBlockedProbeIsAbandonedNotWaitedFor(t *testing.T) {
 
 	start := time.Now()
 	r := e.sup.Visit(ctx, bad, e.dataFile(bad, "node-a001"))
-	if got, want := summary(r), "rpc=timeout open=skipped write=skipped read=skipped close=skipped"; got != want {
+	if got, want := summary(r), "rpc=timeout open=skipped verify=skipped write=skipped read=skipped close=skipped"; got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 	if r.State != "FULL" {
@@ -259,20 +284,101 @@ func TestBlockedProbeIsAbandonedNotWaitedFor(t *testing.T) {
 	}
 }
 
-func TestSilentWorkerIsGivenUpAfterTheGrace(t *testing.T) {
+func TestSilentWorkerIsGivenUpButNotCalledATimeout(t *testing.T) {
 	e := newEnv(t, 100*time.Millisecond)
 	e.mode = "silent"
 	d := e.device("testfs-OST0001-osc-"+inst, "10.0.0.2@tcp", "FULL")
 	start := time.Now()
 	r := e.sup.Visit(context.Background(), d, e.dataFile(d, "node-a001"))
-	if got, want := summary(r), "rpc=timeout open=skipped write=skipped read=skipped close=skipped"; got != want {
+	// No step is known to have passed its deadline: the worker failed, the
+	// target is not accused of a timeout.
+	if got, want := summary(r), "rpc=error open=skipped verify=skipped write=skipped read=skipped close=skipped"; got != want {
 		t.Errorf("got %q, want %q", got, want)
+	}
+	if !strings.Contains(r.Steps[0].Detail, "said nothing") {
+		t.Errorf("detail %q", r.Steps[0].Detail)
 	}
 	if d := time.Since(start); d < 300*time.Millisecond || d > 3*time.Second {
 		t.Errorf("gave up after %v", d)
 	}
 	// Its input is closed, so this worker ends by itself.
 	waitFor(t, "the silent worker to exit", func() bool { return e.sup.Abandoned() == 0 })
+}
+
+func TestFrozenWorkerDoesNotProbeWhenItComesBack(t *testing.T) {
+	e := newEnv(t, 100*time.Millisecond)
+	d := e.device("testfs-OST0001-osc-"+inst, "10.0.0.2@tcp", "FULL")
+	data := e.dataFile(d, "node-a001")
+	ctx := context.Background()
+	if got := summary(e.sup.Visit(ctx, d, nil)); got != "rpc=ok" {
+		t.Fatalf("first visit: %q", got)
+	}
+	pid := e.sup.cur.cmd.Process.Pid
+	if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGCONT) })
+
+	r := e.sup.Visit(ctx, d, data)
+	if r.Steps[0].Result != probe.ResultError {
+		t.Fatalf("visit by a frozen worker: %+v", r.Steps)
+	}
+	// Thawed, the worker finds the request it never answered. The parent
+	// has stopped listening: it must not write to the file on its own.
+	if err := syscall.Kill(pid, syscall.SIGCONT); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the thawed worker to exit", func() bool { return e.sup.Abandoned() == 0 })
+	fi, err := os.Stat(filepath.Join(data.Root, "v1", "ost", d.IndexHex, "node-a001"))
+	if err != nil || fi.Size() != 0 {
+		t.Errorf("the file was written to unsupervised: %v, %v", fi, err)
+	}
+	// And the next visit, by a fresh worker, is unaffected.
+	if got := summary(e.sup.Visit(ctx, d, data)); got != "rpc=ok open=ok verify=ok write=ok read=ok close=ok" {
+		t.Errorf("next visit: %q", got)
+	}
+}
+
+func TestWorkerThatDiedBetweenVisitsIsReplaced(t *testing.T) {
+	e := newEnv(t, 5*time.Second)
+	d := e.device("testfs-OST0001-osc-"+inst, "10.0.0.2@tcp", "FULL")
+	ctx := context.Background()
+	if got := summary(e.sup.Visit(ctx, d, nil)); got != "rpc=ok" {
+		t.Fatalf("first visit: %q", got)
+	}
+	old := e.sup.cur.cmd.Process
+	if err := old.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	// Whether the death is noticed when the request is written or when the
+	// answer is awaited, the target is not blamed for it.
+	for i := 0; i < 3; i++ {
+		if got := summary(e.sup.Visit(ctx, d, nil)); got != "rpc=ok" {
+			t.Fatalf("visit %d after the worker died: %q", i, got)
+		}
+	}
+	if e.sup.cur.cmd.Process.Pid == old.Pid {
+		t.Error("the dead worker is still the current one")
+	}
+}
+
+func TestWorkerStderrIsForwardedNotInherited(t *testing.T) {
+	e := newEnv(t, 5*time.Second)
+	e.mode = "noisy"
+	d := e.device("testfs-OST0001-osc-"+inst, "10.0.0.2@tcp", "FULL")
+	if got := summary(e.sup.Visit(context.Background(), d, nil)); got != "rpc=ok" {
+		t.Fatalf("visit: %q", got)
+	}
+	waitFor(t, "the worker's standard error", func() bool { return strings.Contains(e.stderr.String(), "a word from the worker") })
+	// The worker's standard error is a pipe of its own, whatever ours is.
+	link, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/2", e.sup.cur.cmd.Process.Pid))
+	if err != nil || !strings.HasPrefix(link, "pipe:") {
+		t.Errorf("worker stderr is %q, %v", link, err)
+	}
+	mine, _ := os.Readlink("/proc/self/fd/2")
+	if link == mine {
+		t.Errorf("the worker shares this process's standard error (%s)", link)
+	}
 }
 
 func TestDeadWorkerIsAnErrorNotATimeout(t *testing.T) {
@@ -330,10 +436,10 @@ func TestInterruptedVisit(t *testing.T) {
 	waitFor(t, "the interrupted worker to exit", func() bool { return e.sup.Abandoned() == 0 })
 }
 
-func TestDiscoverTimeout(t *testing.T) {
+func TestDiscoverBySilentWorker(t *testing.T) {
 	e := newEnv(t, 100*time.Millisecond)
 	e.mode = "silent"
-	if _, _, err := e.sup.Discover(context.Background()); err == nil || !strings.Contains(err.Error(), "did not return") {
+	if _, _, err := e.sup.Discover(context.Background()); err == nil || !strings.Contains(err.Error(), "said nothing") {
 		t.Errorf("err = %v", err)
 	}
 }
@@ -354,10 +460,7 @@ func TestSteps(t *testing.T) {
 	if got := join(Steps(mdt, &worker.Data{VerifyPin: true})); got != "rpc" {
 		t.Errorf("mdt: %q", got)
 	}
-	if got := join(Steps(ost, &worker.Data{})); got != "rpc open write read close" {
+	if got := join(Steps(ost, &worker.Data{})); got != "rpc open verify write read close" {
 		t.Errorf("ost: %q", got)
-	}
-	if got := join(Steps(ost, &worker.Data{VerifyPin: true})); got != "rpc open pin write read close" {
-		t.Errorf("ost with pin: %q", got)
 	}
 }

@@ -68,6 +68,9 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 // grace is how long a silent worker is given beyond the step timeout.
 const grace = 2 * time.Second
 
+// maxTimeout bounds --timeout; a probe that takes an hour has failed.
+const maxTimeout = time.Hour
+
 type checkFlags struct {
 	probeRoot      string
 	fsname         string
@@ -99,7 +102,7 @@ func parseCheckFlags(args []string, stderr io.Writer) (checkFlags, error) {
 	fs.IntVar(&f.maxAbandoned, "max-abandoned", 16, "stop probing when this many workers are blocked")
 	fs.StringVar(&f.lockDir, "lock-dir", "/run/lustremesh", "`directory` of the per-target lock files, on a local file system")
 	fs.StringVar(&f.lfsPath, "lfs-path", "lfs", "the lfs `command`, used to verify the OST of each file")
-	fs.BoolVar(&f.noVerifyPin, "no-verify-pin", false, "write to the files without verifying their OST with lfs")
+	fs.BoolVar(&f.noVerifyPin, "no-verify-pin", false, "write to the files without verifying their OST and layout with lfs")
 	fs.DurationVar(&f.rpcFloor, "rpc-floor", 0, "when the RPC counters cannot be read, take an rpc probe faster than this for a cached answer (0: never)")
 	fs.Float64Var(&f.contendedRatio, "contended-ratio", 0.1, "a probe is contended when it waited for a CPU at least this fraction of its duration")
 	fs.DurationVar(&f.contendedFloor, "contended-floor", 50*time.Microsecond, "and at least this long")
@@ -114,8 +117,8 @@ func parseCheckFlags(args []string, stderr io.Writer) (checkFlags, error) {
 		return f, fmt.Errorf("unexpected argument %q", fs.Arg(0))
 	}
 	switch {
-	case f.timeout <= 0:
-		return f, errors.New("--timeout must be positive")
+	case f.timeout <= 0 || f.timeout > maxTimeout:
+		return f, fmt.Errorf("--timeout must be positive and at most %s", maxTimeout)
 	case f.maxAbandoned < 1:
 		return f, errors.New("--max-abandoned must be at least 1")
 	case f.rpcFloor < 0:
@@ -149,11 +152,9 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 }
 
 func runCheck(args []string, stdout, stderr io.Writer) int {
-	// A file is inherited by the workers as it is. Anything else is copied
-	// to by os/exec from another goroutine, and needs a lock.
-	if _, isFile := stderr.(*os.File); !isFile {
-		stderr = &syncWriter{w: stderr}
-	}
+	// The workers' standard error is copied here from other goroutines.
+	stderr = &syncWriter{w: stderr}
+	closeInheritedOnExec()
 	f, err := parseCheckFlags(args, stderr)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -172,10 +173,11 @@ func runCheck(args []string, stdout, stderr io.Writer) int {
 			return ExitFailed
 		}
 	}
-	// The lock directory is local, so the parent may create it. Everything
-	// on Lustre, the probe root included, is left to the workers.
-	if err := os.MkdirAll(f.lockDir, 0o755); err != nil { //nolint:gosec // lock files are meant to be shared between users
-		fmt.Fprintf(stderr, "lustremesh check: lock directory: %v (create it, or choose another with --lock-dir)\n", err)
+	// The lock directory is local, so the parent may create and check it.
+	// Everything on Lustre, the probe root included, is left to the workers.
+	if err := worker.PrepareLockDir(f.lockDir); err != nil {
+		fmt.Fprintf(stderr, "lustremesh check: lock directory: %v\n"+
+			"create it for this user (mode 0700, on a local file system), or choose another with --lock-dir\n", err)
 		return ExitFailed
 	}
 	exe, err := os.Executable()
@@ -190,9 +192,13 @@ func runCheck(args []string, stdout, stderr io.Writer) int {
 	sup := supervisor.New(supervisor.Config{
 		Command: func() *exec.Cmd {
 			cmd := exec.Command(exe, workerCommand) //nolint:noctx // a worker must outlive any context
-			cmd.Stderr = stderr
+			// A session of its own: a Ctrl-C or a hang-up meant for this
+			// process must not reach a worker, whose death would free the
+			// target's lock while a child of it may still be blocked.
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 			return cmd
 		},
+		Stderr:      stderr,
 		StepTimeout: f.timeout,
 		Grace:       grace,
 		LockDir:     f.lockDir,
@@ -215,6 +221,10 @@ func runCheck(args []string, stdout, stderr io.Writer) int {
 		VerifyPin:    !f.noVerifyPin,
 		LfsPath:      f.lfsPath,
 		MaxAbandoned: f.maxAbandoned,
+		StuckTargets: func() []string {
+			stuck, _ := worker.StuckTargets(f.lockDir)
+			return stuck
+		},
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "lustremesh check: %v\n", err)

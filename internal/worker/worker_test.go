@@ -71,17 +71,18 @@ func (b *fakeBackend) openData(probe.DataSpec) (dataFile, probe.StepResult) {
 	b.file.b = b
 	return b.file, b.openRes
 }
-func (b *fakeBackend) close() {}
+func (b *fakeBackend) close()             {}
+func (b *fakeBackend) inherit([]*os.File) {}
 
 type fakeFile struct {
-	b                    *fakeBackend
-	pin, write, read, cl probe.StepResult
+	b                       *fakeBackend
+	verify, write, read, cl probe.StepResult
 }
 
-func (f *fakeFile) Pin(string, uint32) probe.StepResult {
-	f.b.called("pin")
-	f.b.wait(probe.StepPin)
-	return f.pin
+func (f *fakeFile) Verify(string, bool, uint32) probe.StepResult {
+	f.b.called("verify")
+	f.b.wait(probe.StepVerify)
+	return f.verify
 }
 func (f *fakeFile) Write() probe.StepResult {
 	f.b.called("write")
@@ -100,7 +101,7 @@ func (f *fakeFile) Close() probe.StepResult {
 }
 
 func healthyFile() *fakeFile {
-	return &fakeFile{pin: ok(probe.StepPin), write: ok(probe.StepWrite), read: ok(probe.StepRead), cl: ok(probe.StepClose)}
+	return &fakeFile{verify: ok(probe.StepVerify), write: ok(probe.StepWrite), read: ok(probe.StepRead), cl: ok(probe.StepClose)}
 }
 
 // harness runs a worker in a goroutine and talks to it through pipes.
@@ -199,7 +200,7 @@ func TestVisitRunsEveryStepInOrder(t *testing.T) {
 	h := startWorker(t, b)
 	h.send(visitRequest(t, 1, &Data{Root: "/probe", ClientID: "node-a001", VerifyPin: true}, time.Minute))
 	events := h.until(EventDone)
-	if got, want := summary(events), "rpc=ok open=ok pin=ok write=ok read=ok close=ok"; got != want {
+	if got, want := summary(events), "rpc=ok open=ok verify=ok write=ok read=ok close=ok"; got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
 	var state string
@@ -230,7 +231,7 @@ func TestGateKeepsDataFromUnansweredTarget(t *testing.T) {
 		b := &fakeBackend{rpcResult: probe.StepResult{Result: res}, openRes: ok(probe.StepOpen), file: healthyFile()}
 		h := startWorker(t, b)
 		h.send(visitRequest(t, 1, &Data{VerifyPin: true}, time.Minute))
-		want := "rpc=" + string(res) + " open=skipped pin=skipped write=skipped read=skipped close=skipped"
+		want := "rpc=" + string(res) + " open=skipped verify=skipped write=skipped read=skipped close=skipped"
 		if got := summary(h.until(EventDone)); got != want {
 			t.Errorf("got %q, want %q", got, want)
 		}
@@ -247,20 +248,20 @@ func TestCachedAndContendedPassTheGate(t *testing.T) {
 		b := &fakeBackend{rpcResult: probe.StepResult{Result: res}, openRes: ok(probe.StepOpen), file: healthyFile()}
 		h := startWorker(t, b)
 		h.send(visitRequest(t, 1, &Data{}, time.Minute))
-		want := "rpc=" + string(res) + " open=ok write=ok read=ok close=ok"
+		want := "rpc=" + string(res) + " open=ok verify=ok write=ok read=ok close=ok"
 		if got := summary(h.until(EventDone)); got != want {
 			t.Errorf("got %q, want %q", got, want)
 		}
 	}
 }
 
-func TestUnverifiedPinIsNeverWritten(t *testing.T) {
+func TestUnverifiedFileIsNeverWritten(t *testing.T) {
 	f := healthyFile()
-	f.pin = probe.StepResult{Result: probe.ResultUnprepared, Detail: "on OST 5"}
+	f.verify = probe.StepResult{Result: probe.ResultUnprepared, Detail: "on OST 5"}
 	b := &fakeBackend{rpcResult: ok(probe.StepRPC), openRes: ok(probe.StepOpen), file: f}
 	h := startWorker(t, b)
 	h.send(visitRequest(t, 1, &Data{VerifyPin: true}, time.Minute))
-	if got, want := summary(h.until(EventDone)), "rpc=ok open=ok pin=unprepared write=skipped read=skipped close=ok"; got != want {
+	if got, want := summary(h.until(EventDone)), "rpc=ok open=ok verify=unprepared write=skipped read=skipped close=ok"; got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
 	for _, c := range b.calls {
@@ -274,7 +275,7 @@ func TestFailedOpenAndFailedWrite(t *testing.T) {
 	b := &fakeBackend{rpcResult: ok(probe.StepRPC), openRes: probe.StepResult{Result: probe.ResultUnprepared}}
 	h := startWorker(t, b)
 	h.send(visitRequest(t, 1, &Data{}, time.Minute))
-	if got, want := summary(h.until(EventDone)), "rpc=ok open=unprepared write=skipped read=skipped close=skipped"; got != want {
+	if got, want := summary(h.until(EventDone)), "rpc=ok open=unprepared verify=skipped write=skipped read=skipped close=skipped"; got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
 
@@ -283,13 +284,13 @@ func TestFailedOpenAndFailedWrite(t *testing.T) {
 	b = &fakeBackend{rpcResult: ok(probe.StepRPC), openRes: ok(probe.StepOpen), file: f}
 	h = startWorker(t, b)
 	h.send(visitRequest(t, 1, &Data{}, time.Minute))
-	if got, want := summary(h.until(EventDone)), "rpc=ok open=ok write=error read=skipped close=ok"; got != want {
+	if got, want := summary(h.until(EventDone)), "rpc=ok open=ok verify=ok write=error read=skipped close=ok"; got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
 func TestBlockedStepTimesOutThenReportsLateAndExits(t *testing.T) {
-	for _, step := range []probe.Step{probe.StepRPC, probe.StepOpen, probe.StepPin, probe.StepWrite, probe.StepRead, probe.StepClose} {
+	for _, step := range []probe.Step{probe.StepRPC, probe.StepOpen, probe.StepVerify, probe.StepWrite, probe.StepRead, probe.StepClose} {
 		t.Run(string(step), func(t *testing.T) {
 			b := &fakeBackend{rpcResult: ok(probe.StepRPC), openRes: ok(probe.StepOpen), file: healthyFile(),
 				blockStep: step, block: make(chan struct{})}
@@ -313,8 +314,16 @@ func TestBlockedStepTimesOutThenReportsLateAndExits(t *testing.T) {
 				t.Fatalf("event while blocked: %+v", ev)
 			case <-time.After(100 * time.Millisecond):
 			}
-			if _, held, err := acquire(req.Visit.LockDir, "testfs-OST0003"); err != nil || !held {
-				t.Fatalf("lock while blocked: held=%v err=%v", held, err)
+			// Another process finds the target stuck at once, without waiting.
+			start := time.Now()
+			if _, state, err := acquire(req.Visit.LockDir, "testfs-OST0003", time.Minute); err != nil || state != lockStuck {
+				t.Fatalf("lock while blocked: state=%v err=%v", state, err)
+			}
+			if d := time.Since(start); d > 5*time.Second {
+				t.Fatalf("waited %v for a stuck target", d)
+			}
+			if stuck, err := StuckTargets(req.Visit.LockDir); err != nil || len(stuck) != 1 || stuck[0] != "testfs-OST0003" {
+				t.Fatalf("StuckTargets: %v, %v", stuck, err)
 			}
 
 			close(b.block)
@@ -377,62 +386,229 @@ type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
-func TestHeldLockMeansStuck(t *testing.T) {
+func TestBusyTargetIsWaitedForNotCalledStuck(t *testing.T) {
+	b := &fakeBackend{rpcResult: ok(probe.StepRPC)}
+	h := startWorker(t, b)
+	req := visitRequest(t, 1, nil, 300*time.Millisecond)
+
+	// Another process is in the middle of a healthy visit.
+	other, state, err := acquire(req.Visit.LockDir, "testfs-OST0003", 0)
+	if err != nil || state != lockAcquired {
+		t.Fatalf("acquire: state=%v err=%v", state, err)
+	}
+	// It finishes while this worker waits: the visit goes ahead.
+	go func(l *targetLock) {
+		time.Sleep(50 * time.Millisecond)
+		l.release()
+	}(other)
+	h.send(req)
+	if got := summary(h.until(EventDone)); got != "rpc=ok" {
+		t.Errorf("after a short wait: %q", got)
+	}
+
+	// It never finishes within the wait: busy, not stuck, and nothing sent.
+	other, _, _ = acquire(req.Visit.LockDir, "testfs-OST0003", 0)
+	defer other.release()
+	b.mu.Lock()
+	b.calls = nil
+	b.mu.Unlock()
+	req.ID = 2
+	start := time.Now()
+	h.send(req)
+	events := h.until(EventDone)
+	done := events[len(events)-1]
+	if !done.Busy || done.Stuck || len(b.calls) != 0 {
+		t.Fatalf("done %+v, calls %v", done, b.calls)
+	}
+	if d := time.Since(start); d < 250*time.Millisecond {
+		t.Errorf("gave up on a busy target after %v", d)
+	}
+	if stuck, _ := StuckTargets(req.Visit.LockDir); len(stuck) != 0 {
+		t.Errorf("a busy target is listed as stuck: %v", stuck)
+	}
+
+	// Its holder passes a deadline: stuck, reported without waiting.
+	other.markStuck()
+	req.ID = 3
+	start = time.Now()
+	h.send(req)
+	events = h.until(EventDone)
+	done = events[len(events)-1]
+	if !done.Stuck || done.Busy || len(b.calls) != 0 {
+		t.Fatalf("done %+v, calls %v", done, b.calls)
+	}
+	if d := time.Since(start); d > 200*time.Millisecond {
+		t.Errorf("waited %v for a stuck target", d)
+	}
+}
+
+func TestLockIsReleasedBeforeDone(t *testing.T) {
 	b := &fakeBackend{rpcResult: ok(probe.StepRPC)}
 	h := startWorker(t, b)
 	req := visitRequest(t, 1, nil, time.Minute)
-	l, held, err := acquire(req.Visit.LockDir, "testfs-OST0003")
-	if err != nil || held {
-		t.Fatalf("acquire: held=%v err=%v", held, err)
-	}
-	h.send(req)
-	events := h.until(EventDone)
-	if !events[len(events)-1].Stuck || len(b.calls) != 0 {
-		t.Fatalf("events %+v, calls %v", events, b.calls)
-	}
-
-	// Released, the same worker probes the target.
-	l.release()
-	req.ID = 2
-	h.send(req)
-	if got := summary(h.until(EventDone)); got != "rpc=ok" {
-		t.Errorf("after release: %q", got)
-	}
-	// And released its own lock at the end of the visit.
-	if l, held, err := acquire(req.Visit.LockDir, "testfs-OST0003"); err != nil || held {
-		t.Errorf("lock after the visit: held=%v err=%v", held, err)
-	} else {
+	for i := 0; i < 20; i++ {
+		req.ID = uint64(i + 1)
+		h.send(req)
+		h.until(EventDone)
+		l, state, err := acquire(req.Visit.LockDir, "testfs-OST0003", 0)
+		if err != nil || state != lockAcquired {
+			t.Fatalf("visit %d: lock state=%v err=%v", i, state, err)
+		}
 		l.release()
 	}
 }
 
-func TestLockSurvivesOnlyAsLongAsItsHolder(t *testing.T) {
-	// The lock is a flock on an open file: a process that dies, however it
-	// dies, releases it. Closing the descriptor stands for that here.
+func TestLocks(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "testfs-OST0000.lock")
-	f, err := os.OpenFile(path, os.O_RDONLY|os.O_CREATE, 0o644)
-	if err != nil {
-		t.Fatal(err)
+	// A lock lasts as long as an open file that holds it: closing the files
+	// stands here for the end of the process, however it ends.
+	a, state, err := acquire(dir, "testfs-OST0000", 0)
+	if err != nil || state != lockAcquired {
+		t.Fatalf("first: state=%v err=%v", state, err)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		t.Fatal(err)
+	if _, state, _ := acquire(dir, "testfs-OST0000", 0); state != lockBusy {
+		t.Fatalf("second: state=%v", state)
 	}
-	if _, held, _ := acquire(dir, "testfs-OST0000"); !held {
-		t.Fatal("not held")
+	// Another target is not affected.
+	if l, state, _ := acquire(dir, "testfs-OST0001", 0); state != lockAcquired {
+		t.Fatalf("other target: state=%v", state)
+	} else {
+		l.release()
 	}
-	_ = f.Close()
-	l, held, err := acquire(dir, "testfs-OST0000")
-	if err != nil || held {
-		t.Fatalf("after close: held=%v err=%v", held, err)
+	a.markStuck()
+	if _, state, _ := acquire(dir, "testfs-OST0000", time.Minute); state != lockStuck {
+		t.Fatalf("after markStuck: state=%v", state)
+	}
+	// A child that inherited the files keeps both locks after its parent.
+	dup := make([]*os.File, 0, 2)
+	for _, f := range a.files() {
+		fd, err := syscall.Dup(int(f.Fd()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		dup = append(dup, os.NewFile(uintptr(fd), f.Name()))
+	}
+	a.release()
+	if _, state, _ := acquire(dir, "testfs-OST0000", 0); state != lockStuck {
+		t.Fatalf("held by the inherited files only: state=%v", state)
+	}
+	for _, f := range dup {
+		_ = f.Close()
+	}
+	l, state, err := acquire(dir, "testfs-OST0000", 0)
+	if err != nil || state != lockAcquired {
+		t.Fatalf("after everything closed: state=%v err=%v", state, err)
 	}
 	l.release()
+	if stuck, err := StuckTargets(dir); err != nil || len(stuck) != 0 {
+		t.Errorf("StuckTargets: %v, %v", stuck, err)
+	}
 
-	if _, _, err := acquire(filepath.Join(dir, "missing"), "x"); err == nil {
+	// Lock files are private and never reached through a symbolic link.
+	fi, err := os.Stat(filepath.Join(dir, "testfs-OST0000.lock"))
+	if err != nil || fi.Mode().Perm() != 0o600 {
+		t.Errorf("lock file: %v, %v", fi, err)
+	}
+	victim := filepath.Join(t.TempDir(), "victim")
+	if err := os.Symlink(victim, filepath.Join(dir, "testfs-OST0002.lock")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := acquire(dir, "testfs-OST0002", 0); err == nil {
+		t.Error("a lock file that is a symbolic link was accepted")
+	}
+	if _, err := os.Lstat(victim); !os.IsNotExist(err) {
+		t.Errorf("the link's destination was created: %v", err)
+	}
+
+	if _, _, err := acquire(filepath.Join(dir, "missing"), "x", 0); err == nil {
 		t.Error("missing lock directory: no error")
 	}
-	if _, _, err := acquire("", "x"); err == nil {
+	if _, _, err := acquire("", "x", 0); err == nil {
 		t.Error("empty lock directory: no error")
+	}
+}
+
+func TestPrepareLockDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "run", "lustremesh")
+	if err := PrepareLockDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Errorf("created as %v, %v", fi, err)
+	}
+	if err := PrepareLockDir(dir); err != nil {
+		t.Errorf("existing directory: %v", err)
+	}
+	// Writable by others: they could redirect or hold the lock files.
+	for _, mode := range []os.FileMode{0o777, 0o770, 0o1777} {
+		if err := os.Chmod(dir, mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := PrepareLockDir(dir); err == nil {
+			t.Errorf("mode %o accepted", mode)
+		}
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := PrepareLockDir(dir); err != nil {
+		t.Errorf("mode 0755: %v", err)
+	}
+	// Somebody else's directory.
+	if os.Geteuid() == 0 {
+		if err := os.Chown(dir, 65534, 65534); err != nil {
+			t.Fatal(err)
+		}
+		if err := PrepareLockDir(dir); err == nil {
+			t.Error("another user's directory accepted")
+		}
+	}
+	// A symbolic link is not a directory of ours to check.
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(t.TempDir(), link); err != nil {
+		t.Fatal(err)
+	}
+	if err := PrepareLockDir(link); err == nil {
+		t.Error("a symbolic link accepted")
+	}
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := PrepareLockDir(file); err == nil {
+		t.Error("a file accepted")
+	}
+}
+
+func TestAbandonedWorkerStartsNothingMore(t *testing.T) {
+	// The parent gives the worker up (closes its input) while a step runs
+	// and no deadline has passed. When the step returns, the worker must
+	// not go on to the next one: nobody supervises it any more.
+	b := &fakeBackend{rpcResult: ok(probe.StepRPC), openRes: ok(probe.StepOpen), file: healthyFile(),
+		blockStep: probe.StepOpen, block: make(chan struct{})}
+	h := startWorker(t, b)
+	h.send(visitRequest(t, 1, &Data{}, time.Minute))
+	for {
+		ev := <-h.events
+		if ev.Type == EventBegin && ev.Step == probe.StepOpen {
+			break
+		}
+	}
+	_ = h.in.Close()
+	time.Sleep(50 * time.Millisecond) // let the worker see the end of its input
+	close(b.block)
+	select {
+	case code := <-h.exit:
+		if code != 0 {
+			t.Errorf("exit status %d", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the worker did not exit")
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if last := b.calls[len(b.calls)-1]; last != "open" {
+		t.Errorf("%v ran after the worker was given up", b.calls)
 	}
 }
 

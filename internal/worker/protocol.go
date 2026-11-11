@@ -27,17 +27,24 @@ type Request struct {
 	ID uint64 `json:"id"`
 	Op string `json:"op"`
 	// StepTimeoutNanos is the deadline of each step.
-	StepTimeoutNanos int64        `json:"step_timeout_nanos"`
-	Probe            probe.Config `json:"probe"`
-	Visit            *Visit       `json:"visit,omitempty"`
+	StepTimeoutNanos int64 `json:"step_timeout_nanos"`
+	// SentUnixNanos is when the parent sent the request, and SilenceNanos
+	// how long the parent waits without news before it gives the worker up.
+	// A worker that finds itself later than that (it was stopped, or
+	// starved of CPU) starts no step: nobody is listening any more.
+	SentUnixNanos int64        `json:"sent_unix_nanos"`
+	SilenceNanos  int64        `json:"silence_nanos"`
+	Probe         probe.Config `json:"probe"`
+	Visit         *Visit       `json:"visit,omitempty"`
 }
 
 // Visit is one pass over one target: the rpc probe, then the data probe.
 type Visit struct {
 	Device target.Device `json:"device"`
-	// LockDir holds one lock file per target, on a local file system. The
-	// worker keeps the target's lock for the whole visit, so that a blocked
-	// worker, even one left behind by an earlier run, keeps others away.
+	// LockDir holds the lock files of the targets, on a local file system.
+	// The worker keeps the target's lock for the whole visit, so that a
+	// blocked worker, even one left behind by an earlier run, keeps others
+	// away (see lock.go).
 	LockDir string `json:"lock_dir"`
 	// Data is nil for a visit with the rpc probe only.
 	Data *Data `json:"data,omitempty"`
@@ -83,10 +90,13 @@ type Event struct {
 	// State is the import state read just before the rpc probe (EventState).
 	State string `json:"state,omitempty"`
 
-	// On EventDone of a visit:
-	// Stuck says that another process holds the target's lock: an earlier
-	// probe of this target is still blocked, and nothing was sent.
+	// On EventDone of a visit that sent nothing:
+	// Stuck says that a probe of this target, sent by another process, is
+	// still blocked past its deadline.
 	Stuck bool `json:"stuck,omitempty"`
+	// Busy says that another process was visiting the target for as long
+	// as this one was willing to wait.
+	Busy bool `json:"busy,omitempty"`
 
 	// On EventDone of a discovery:
 	Devices []target.Device `json:"devices,omitempty"`

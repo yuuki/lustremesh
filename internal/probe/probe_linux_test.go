@@ -235,6 +235,13 @@ func TestDataProbeRoundTrip(t *testing.T) {
 	if r.Result != ResultOK || f == nil || r.Nanos == nil {
 		t.Fatalf("open: %+v", r)
 	}
+	// A file that was not verified is never written to.
+	if r := f.Write(); r.Result != ResultError || r.Nanos != nil {
+		t.Fatalf("write before verify: %+v", r)
+	}
+	if r := f.Verify("", false, 3); r.Result != ResultOK {
+		t.Fatalf("verify: %+v", r)
+	}
 	if r := f.Write(); r.Result != ResultOK || r.Nanos == nil {
 		t.Fatalf("write: %+v", r)
 	}
@@ -264,16 +271,43 @@ func TestReadDetectsMismatch(t *testing.T) {
 		t.Fatalf("open: %+v", r)
 	}
 	defer f.Close()
+	if r := f.Verify("", false, 3); r.Result != ResultOK {
+		t.Fatalf("verify: %+v", r)
+	}
 	if r := f.Write(); r.Result != ResultOK {
 		t.Fatalf("write: %+v", r)
 	}
-	// Somebody else overwrites the page between the write and the read.
+	// Something overwrites the page between the write and the read.
 	other := make([]byte, os.Getpagesize())
 	if err := os.WriteFile(spec.Path(), other, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if r := f.Read(); r.Result != ResultMismatch {
-		t.Fatalf("read: %+v", r)
+	if r := f.Read(); r.Result != ResultMismatch || strings.Contains(r.Detail, "client ID") {
+		t.Fatalf("garbage: %+v", r)
+	}
+	// Another probe's page is told apart from corruption.
+	BuildPayload(other, "node-a001", 99, time.Now())
+	if err := os.WriteFile(spec.Path(), other, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.Read(); r.Result != ResultMismatch || !strings.Contains(r.Detail, "client ID") {
+		t.Fatalf("another probe's page: %+v", r)
+	}
+}
+
+func TestClassifyRPCError(t *testing.T) {
+	tests := map[error]Result{
+		syscall.EAGAIN:    ResultDisconnected,
+		syscall.ESHUTDOWN: ResultInactive,
+		syscall.ENODATA:   ResultInactive,
+		syscall.EIO:       ResultError,
+		syscall.ENODEV:    ResultError,
+		errors.New("x"):   ResultError,
+	}
+	for err, want := range tests {
+		if got := classifyRPCError(err); got != want {
+			t.Errorf("%v: %s, want %s", err, got, want)
+		}
 	}
 }
 
@@ -331,8 +365,16 @@ func TestOpenDataRefusesUnsuitableFiles(t *testing.T) {
 		if err := os.Link(victim, spec.Path()); err != nil {
 			t.Fatal(err)
 		}
-		if f, r := p.OpenData(spec); f != nil || r.Result != ResultUnprepared || !strings.Contains(r.Detail, "hard links") {
-			t.Fatalf("got %+v", r)
+		f, r := p.OpenData(spec)
+		if f == nil {
+			t.Fatalf("open: %+v", r)
+		}
+		defer f.Close()
+		if r := f.Verify("", false, 3); r.Result != ResultUnprepared || !strings.Contains(r.Detail, "hard links") {
+			t.Fatalf("verify: %+v", r)
+		}
+		if r := f.Write(); r.Result != ResultError {
+			t.Fatalf("write: %+v", r)
 		}
 		if data, _ := os.ReadFile(victim); string(data) != "precious" {
 			t.Fatalf("the victim was written to: %q", data)
@@ -361,7 +403,7 @@ func TestOpenDataRefusesUnsuitableFiles(t *testing.T) {
 	})
 }
 
-// fakeLfs writes a script that stands for "lfs getstripe -i".
+// fakeLfs writes a script that stands for "lfs getstripe".
 func fakeLfs(t *testing.T, body string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "lfs")
@@ -371,7 +413,12 @@ func fakeLfs(t *testing.T, body string) string {
 	return path
 }
 
-func TestPin(t *testing.T) {
+// layout is a script body that prints a plain one-stripe layout on an OST.
+func layout(ost string) string {
+	return `printf '%s\nlmm_stripe_count:  1\nlmm_pattern:       raid0\nlmm_stripe_offset: ` + ost + `\n' "$2"`
+}
+
+func TestVerifyOST(t *testing.T) {
 	spec := dataRoot(t, "0003")
 	if err := os.WriteFile(spec.Path(), nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -387,24 +434,55 @@ func TestPin(t *testing.T) {
 		name, script string
 		want         Result
 	}{
-		{"right OST", `[ "$1 $2" = "getstripe -i" ] && [ -f "$3" ] && echo 3`, ResultOK},
-		{"another OST", `echo 5`, ResultUnprepared},
-		{"several stripes", `printf '3\n4\n'`, ResultUnprepared},
+		{"right OST", `[ "$1" = getstripe ] && [ -f "$2" ] && ` + layout("3"), ResultOK},
+		{"another OST", layout("5"), ResultUnprepared},
+		{"only an index", `echo 3`, ResultUnprepared},
+		{"composite", `printf 'lcm_entry_count: 2\nlmm_stripe_count: 1\nlmm_pattern: raid0\nlmm_stripe_offset: 3\n'`, ResultUnprepared},
+		{"data on the MDT", `printf 'lmm_stripe_count: 1\nlmm_pattern: mdt\nlmm_stripe_offset: 3\n'`, ResultUnprepared},
 		{"no output", `true`, ResultUnprepared},
-		{"lfs fails", `echo "not a Lustre file" >&2; exit 1`, ResultUnprepared},
+		{"lfs fails", `printf 'not a\nLustre\tfile\033[31m' >&2; exit 1`, ResultUnprepared},
 	}
 	for _, tc := range tests {
-		if got := f.Pin(fakeLfs(t, tc.script), 3); got.Result != tc.want {
-			t.Errorf("%s: %+v", tc.name, got)
+		f.verified = false
+		got := f.Verify(fakeLfs(t, tc.script), true, 3)
+		if got.Result != tc.want || f.verified != (tc.want == ResultOK) {
+			t.Errorf("%s: %+v (verified=%v)", tc.name, got, f.verified)
+		}
+		if strings.ContainsAny(got.Detail, "\n\t\x1b") {
+			t.Errorf("%s: the detail spans lines or has control characters: %q", tc.name, got.Detail)
 		}
 	}
-	if got := f.Pin(filepath.Join(t.TempDir(), "no-such-lfs"), 3); got.Result != ResultUnprepared {
+	if got := f.Verify(filepath.Join(t.TempDir(), "no-such-lfs"), true, 3); got.Result != ResultUnprepared || f.verified {
 		t.Errorf("missing lfs: %+v", got)
 	}
 
 	// The path is replaced while lfs runs: the answer is about another file.
-	swap := fakeLfs(t, `mv "$3" "$3.old" && : > "$3" && echo 3`)
-	if got := f.Pin(swap, 3); got.Result != ResultUnprepared || !strings.Contains(got.Detail, "changed") {
+	swap := fakeLfs(t, `mv "$2" "$2.old" && : > "$2" && `+layout("3"))
+	if got := f.Verify(swap, true, 3); got.Result != ResultUnprepared || !strings.Contains(got.Detail, "changed") || f.verified {
 		t.Errorf("swapped file: %+v", got)
+	}
+}
+
+func TestLfsInheritsTheLockFiles(t *testing.T) {
+	spec := dataRoot(t, "0003")
+	if err := os.WriteFile(spec.Path(), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.Create(filepath.Join(t.TempDir(), "lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	p := newTestProber(t, Config{})
+	p.Inherit = []*os.File{lock}
+	f, r := p.OpenData(spec)
+	if f == nil {
+		t.Fatalf("open: %+v", r)
+	}
+	defer f.Close()
+	// The script succeeds only if descriptor 3 is the inherited lock file.
+	script := `[ "$(readlink /proc/$$/fd/3)" = "` + lock.Name() + `" ] && ` + layout("3")
+	if got := f.Verify(fakeLfs(t, script), true, 3); got.Result != ResultOK {
+		t.Errorf("got %+v", got)
 	}
 }
