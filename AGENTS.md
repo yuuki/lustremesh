@@ -23,7 +23,8 @@
 
 ## Before opening a pull request
 - `make check`; also `make test-fuzz` for a parser or a name check.
-- The watchdog, the locks, the supervisor or the holds: `go test -race -count=20 ./internal/worker/ ./internal/supervisor/ ./internal/cli/`.
+- The watchdog, the locks, the supervisor or the holds: `make test-stress` (their tests, 20 times with the race detector).
+- `.github/workflows/`: `make lint-actions` (part of `make check`); after a `uses:` changed, `make lock-actions` (needs a GitHub token) and review the diff of `actions.lock`.
 - Behaviour that depends on Lustre: say in the PR whether it ran on a real file system; CI never does (`docs/design.md` §12).
 
 ## Git conventions
