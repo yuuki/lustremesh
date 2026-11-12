@@ -1,0 +1,5 @@
+lustremesh
+Copyright 2026 Yuuki TSUBOUCHI
+
+This project contains no Lustre source code. It reads the parameter files a
+Lustre client publishes, performs ordinary file I/O and runs the lfs command.
